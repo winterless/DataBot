@@ -1,0 +1,114 @@
+<mxfile host="65bd71144e">
+    <diagram name="DataBot-v1.2.1" id="databot-v121-clean-layout">
+        <mxGraphModel dx="1191" dy="676" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1100" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="cp_lane" value="Control Plane" style="swimlane;fontStyle=1;horizontal=1;startSize=30;rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="30" width="1700" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="ep_lane" value="Execution Plane" style="swimlane;fontStyle=1;horizontal=1;startSize=30;rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="200" width="1700" height="250" as="geometry"/>
+                </mxCell>
+                <mxCell id="aicoder" value="AI Coder (External Service)&#10;Design/Update UDatasets Adapter&#10;PR/Diff Only + Sandbox" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="570" y="70" width="240" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="world_src" value="World Dataset Sources&#10;- HuggingFace&#10;- GitHub&#10;- ..." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="40" y="70" width="190" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="datasearcher" value="DataSearcher (Internal)&#10;Search + Download &amp; Sample&#10;Gemini/Qwen API" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="270" y="70" width="230" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" value="" style="endArrow=classic;html=1;rounded=0;orthogonalLoop=1;strokeColor=#ffffff;" parent="ep_lane" source="world_src" target="datasearcher" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" value="sample" style="endArrow=classic;html=1;rounded=0;orthogonalLoop=1;strokeColor=#ffffff;" parent="ep_lane" source="datasearcher" target="aicoder" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="eval" value="Eval (External)&#10;Quality / Latency / Robustness&#10;Regression Signal" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="1430" y="70" width="220" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" value="feedback" style="endArrow=classic;html=1;rounded=1;dashed=1;strokeColor=#ffffff;" parent="ep_lane" source="eval" target="aicoder" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1520" y="50"/>
+                            <mxPoint x="1100" y="50"/>
+                            <mxPoint x="700" y="50"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="llmrunner" value="LLMRunner (External)&#10;Train / Infer&#10;CPT + SFT Input" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="1160" y="70" width="220" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" value="" style="endArrow=classic;html=1;rounded=0;orthogonalLoop=1;strokeColor=#ffffff;" parent="ep_lane" source="llmrunner" target="eval" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="udatasets" value="UDatasets (External)&#10;Clean / Dedup / Standardize&#10;Adapter Transform" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#111111;" parent="ep_lane" vertex="1">
+                    <mxGeometry x="890" y="70" width="230" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" value="" style="endArrow=classic;html=1;rounded=0;orthogonalLoop=1;strokeColor=#ffffff;" parent="ep_lane" source="udatasets" target="llmrunner" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e7" value="adapter" style="endArrow=classic;html=1;rounded=0;strokeColor=#ffffff;" parent="ep_lane" source="aicoder" target="udatasets" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="dp_lane" value="Data Plane" style="swimlane;fontStyle=1;horizontal=1;startSize=30;rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="470" width="1700" height="220" as="geometry">
+                        <mxRectangle x="40" y="470" width="100" height="30" as="alternateBounds"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="raw_store" value="Raw + Sample Cache&#10;(artifact_uri + hash_signature)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#111111;" parent="dp_lane" vertex="1">
+                    <mxGeometry x="260" y="70" width="250" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="model_store" value="Model + Eval Artifacts&#10;weights / logs / reports" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#ffe6cc;strokeColor=#d79b00;fontColor=#111111;" parent="dp_lane" vertex="1">
+                    <mxGeometry x="1410" y="70" width="260" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="orchestrator" value="DataBot Orchestrator Agent&#10;Stateful Workflow + DAG + Resume" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="620" y="80" width="280" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="state_db" value="State DB&lt;br&gt;Run / Task / Artifact" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="960" y="85" width="220" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="response_env" value="5.5 Response Envelope&#10;status / error / data" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="1220" y="85" width="220" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="eval_path" value="${EVAL_HOME:-/home/unlimitediw/workspace/eval}" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="1410" y="400" width="300" height="25" as="geometry"/>
+                </mxCell>
+                <mxCell id="processed_store" value="Processed Data&#10;Cleaned / CPT / SFT" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="920" y="540" width="250" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="contract_note" value="Step Contracts v1.2&#10;5.1 / 5.2 / 5.3 / 5.4" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="1460" y="85" width="220" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" value="" style="endArrow=classic;html=1;rounded=0;orthogonalLoop=1;strokeColor=#ffffff;" parent="1" source="orchestrator" target="state_db" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e8" value="" style="endArrow=classic;html=1;rounded=0;dashed=1;strokeColor=#ffffff;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" parent="1" source="udatasets" target="response_env" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e9" value="" style="endArrow=classic;html=1;rounded=0;dashed=1;strokeColor=#ffffff;" parent="1" source="llmrunner" target="response_env" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e10" value="" style="endArrow=classic;html=1;rounded=0;dashed=1;strokeColor=#ffffff;" parent="1" source="eval" target="response_env" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e11" value="" style="endArrow=classic;html=1;rounded=0;dashed=1;strokeColor=#ffffff;" parent="1" source="response_env" target="orchestrator" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e12" value="" style="endArrow=classic;html=1;rounded=0;strokeColor=#ffffff;" parent="1" source="datasearcher" target="raw_store" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e13" value="" style="endArrow=classic;html=1;rounded=0;strokeColor=#ffffff;" parent="1" source="udatasets" target="processed_store" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e14" value="" style="endArrow=classic;html=1;rounded=0;strokeColor=#ffffff;" parent="1" source="llmrunner" target="model_store" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e15" value="" style="endArrow=classic;html=1;rounded=0;strokeColor=#ffffff;" parent="1" source="eval" target="model_store" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
