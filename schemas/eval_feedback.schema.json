@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvalFeedback",
+  "type": "object",
+  "required": ["trace_info", "eval_results"],
+  "properties": {
+    "trace_info": {"type": "object"},
+    "eval_results": {"type": "object"}
+  },
+  "additionalProperties": true
+}

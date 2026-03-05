@@ -1,0 +1,6 @@
+fastapi
+jsonschema
+pydantic
+torch
+transformers
+uvicorn

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResponseEnvelope",
+  "type": "object",
+  "required": ["status", "error", "data"],
+  "properties": {
+    "status": {"type": "string", "enum": ["SUCCESS", "FAILED"]},
+    "error": {"type": ["object", "null"]},
+    "data": {"type": ["object", "null"]}
+  },
+  "additionalProperties": true
+}

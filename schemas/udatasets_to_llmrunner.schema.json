@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UDatasetsToLLMRunner",
+  "type": "object",
+  "required": ["trace_info", "processed_data"],
+  "properties": {
+    "trace_info": {"type": "object"},
+    "processed_data": {"type": "object"}
+  },
+  "additionalProperties": true
+}

@@ -17,6 +17,7 @@
     "retries": 2,
     "verify_hf_exists": true
   },
+  "source_policy_file": "configs/source_policy.json",
   "source_policy": {
     "huggingface": 6,
     "github": 4

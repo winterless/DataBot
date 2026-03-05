@@ -145,7 +145,7 @@
     "idempotency_key": "run_1710502394_step_train_01_attempt_1"
   },
   "model_info": {
-    "weights_uri": "file:///data/models/run_1710502394/checkpoint-1000",
+    "weights_uri": "file:///llmrunner_artifacts/run_1710502394/checkpoint-1000",
     "base_model": "qwen-1.5-7b"
   },
   "eval_config": {
@@ -253,3 +253,66 @@
 
 - 接入 `Eval`，实现结构化指标回流
 - 部署 `AI Coder` 双触发逻辑（前置 adapter 设计 + 后置反馈优化，均仅限 PR 生成模式），跑通从数据采样到评估回流的全链路
+
+## 8. 代码目录（归一化，简化版）
+
+为避免多文档分叉维护，**目录结构以本文件为唯一来源**。`CODE_STRUCTURE.md` 不再单独维护。
+
+### 8.1 仓内目录（DataBot）
+
+```text
+DataBot/
+├── pipeline_architecture.md
+├── configs/
+│   ├── datasearcher_api.json
+│   ├── source_policy.json
+│   └── prompts/datasearcher_prompt.txt
+├── schemas/
+│   ├── datasearcher_to_udatasets.schema.json
+│   ├── udatasets_to_llmrunner.schema.json
+│   ├── llmrunner_to_eval.schema.json
+│   ├── eval_feedback.schema.json
+│   └── response_envelope.schema.json
+├── src/
+│   ├── datasearcher/
+│   │   ├── client.py
+│   │   ├── downloader.py
+│   │   ├── function_tools.py
+│   │   ├── source_selector.py
+│   │   └── api_clients/{huggingface_api.py,github_api.py}
+│   ├── orchestrator/
+│   │   ├── main.py
+│   │   ├── dag.py
+│   │   ├── scheduler.py
+│   │   ├── checkpoint.py
+│   │   ├── retry_policy.py
+│   │   ├── lineage.py
+│   │   └── runners/{datasearcher_runner.py,udatasets_runner.py,llmrunner_runner.py,eval_runner.py,aicoder_runner.py}
+│   ├── contracts/{validator.py,builders.py}
+│   └── state/{db.py,models.py,run_repo.py,task_repo.py,artifact_repo.py}
+├── src/utils/logger.py
+├── state/migrations/{001_init_run_task_artifact.sql,002_indexes.sql}
+├── smoke_datasearcher.sh
+├── .env.example
+├── requirements.txt
+├── logs/
+├── out/
+├── data/
+└── reports/
+```
+
+### 8.2 目录职责（最小说明）
+
+- `src/datasearcher/`：数据发现与下载（内部执行器）。
+- `src/orchestrator/`：工作流编排、状态推进、重试与断点续跑（控制层）。
+- `src/state/` + `state/migrations/`：Run/Task/Artifact 持久化与迁移。
+- `schemas/` + `src/contracts/`：Schema 文件与 Python 校验器分层，避免 import 歧义。
+- `data/` / `out/` / `reports/`：原始数据、运行产物、评测报告；模型产物由 `LLMRunner` 管理（不在本仓落盘）。
+- `src/utils/logger.py` + `logs/`：统一 JSON 日志（时间戳、级别、trace_id/run_id/step_id）。
+
+### 8.3 外部模块（不在本仓）
+
+- `UDatasets`：`${UDATASETS_HOME:-/home/unlimitediw/workspace/UDatasets}`
+- `LLMRunner`：`${LLMRUNNER_HOME:-/home/unlimitediw/workspace/LLMRunner}`
+- `Eval`：`${EVAL_HOME:-/home/unlimitediw/workspace/eval}`
+- `AI Coder`：Cursor Admin API / Sandbox Service（仅 PR/Diff 输出）

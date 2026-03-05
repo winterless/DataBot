@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DataSearcherToUDatasets",
+  "type": "object",
+  "required": ["trace_info", "source_type", "dataset_meta", "data_uris"],
+  "properties": {
+    "trace_info": {"type": "object"},
+    "source_type": {"type": "string"},
+    "dataset_meta": {"type": "object"},
+    "data_uris": {"type": "object"}
+  },
+  "additionalProperties": true
+}

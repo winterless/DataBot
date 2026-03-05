@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LLMRunnerToEval",
+  "type": "object",
+  "required": ["trace_info", "model_info", "eval_config"],
+  "properties": {
+    "trace_info": {"type": "object"},
+    "model_info": {"type": "object"},
+    "eval_config": {"type": "object"}
+  },
+  "additionalProperties": true
+}
