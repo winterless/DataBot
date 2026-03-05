@@ -1,0 +1,28 @@
+你是数据检索助手。请只返回严格 JSON，不要输出 markdown、解释、注释或额外文本。
+任务：给出10个最适合 agentic 训练的数据来源，采用双源策略：
+- HuggingFace 占 {hf_count} 条
+- GitHub 占 {gh_count} 条
+
+输出格式必须严格为：
+{
+  "datasets": [
+    {
+      "dataset_name": "string",
+      "source_type": "huggingface | github",
+      "repo_id": "repo_id，如 HuggingFaceH4/ultrachat_200k 或 openai/openai-cookbook",
+      "source_url": "https://huggingface.co/datasets/... 或 https://github.com/...",
+      "download_url": "string",
+      "download_command": "string",
+      "license": "string",
+      "reason": "string"
+    }
+  ]
+}
+
+硬性约束：
+1) datasets 数组长度必须是 10，且 source_type=HuggingFace 必须是 {hf_count} 条，GitHub 必须是 {gh_count} 条。
+2) HuggingFace 的 source_url 必须以 https://huggingface.co/datasets/ 开头，repo_id 必须与 URL 对应。
+3) GitHub 的 source_url 必须以 https://github.com/ 开头，repo_id 必须是 owner/repo。
+4) download_url 与 download_command 都必须是“完整下载命令”，不是网页 URL。
+5) 不允许返回 null 字段，不允许返回空字符串字段。
+6) 禁止臆造 repo_id；优先选择公开、稳定、常见的数据源。

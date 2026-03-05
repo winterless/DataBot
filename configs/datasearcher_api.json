@@ -1,0 +1,26 @@
+{
+  "default_provider": "aliyun",
+  "providers": {
+    "local": {
+      "host": "127.0.0.1",
+      "port": 8000,
+      "base_url": ""
+    },
+    "aliyun": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-plus",
+      "api_key_env": "DASHSCOPE_API_KEY"
+    }
+  },
+  "request": {
+    "timeout": 600,
+    "retries": 2,
+    "verify_hf_exists": true
+  },
+  "source_policy": {
+    "huggingface": 6,
+    "github": 4
+  },
+  "prompt": "",
+  "prompt_file": "configs/prompts/datasearcher_prompt.txt"
+}

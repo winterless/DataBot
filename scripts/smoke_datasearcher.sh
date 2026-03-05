@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# DataSearcher 烟雾测试：按 MODE 执行 search（样本生成）、download（后台下载）或 all。
+# 用法：MODE=search|download|all API=aliyun|local ./scripts/smoke_datasearcher.sh
+# 输出与日志：out/datasearcher/（sample、download_report、nohup 等）
+set -euo pipefail
+
+API="${API:-aliyun}"   # export API=local to use local provider
+MODE="${MODE:-all}"    # search | download | all
+
+mkdir -p out/datasearcher
+case "${MODE}" in
+  search) python "src/datasearcher/client.py" --api "${API}" ;;
+  download) nohup python "src/datasearcher/downloader.py" > "out/datasearcher/download_nohup.log" 2>&1 & echo $! > "out/datasearcher/download_nohup.pid" ;;
+  all) python "src/datasearcher/client.py" --api "${API}" && nohup python "src/datasearcher/downloader.py" > "out/datasearcher/download_nohup.log" 2>&1 & echo $! > "out/datasearcher/download_nohup.pid" ;;
+  *) echo "MODE must be search|download|all" >&2; exit 2 ;;
+esac
