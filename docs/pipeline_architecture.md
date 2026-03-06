@@ -26,17 +26,24 @@
 
 为保障跨环境协作与 CI/CD 部署，外部模块本地路径禁止硬编码，必须通过配置文件或环境变量（如 `UDATASETS_HOME`）动态注入。
 
-### 3.1 DataSearcher（内置发现模块）
+### 3.1 DataSearcher（内置发现模块 / 语义路由中枢）
 
-- **职责**：接收自然语言或结构化查询，通过真实 API 完成数据源发现与本地样本抽取。
-- **核心检索策略（Function Calling 架构）**：
-  - **严禁纯 Prompt 检索**：绝不允许让大模型直接“凭空”生成 URL，以彻底杜绝 404 幻觉（Hallucination）。
-  - **原生工具调用**：必须采用 LLM Function Calling 模式。大模型只负责意图理解与提取查询参数（Query、License、Stars 等），真正网络请求由本地 Python 函数（调用 HF/GitHub 官方 RESTful API）执行。本地函数拿到真实数据后，再交由大模型做二次筛选组装。
-  - **数据源配比控制（Source Policy）**：
-    - 必须通过配置文件 `source_policy.json` 强控数据源获取比例，不可由大模型自由发散。
-    - MVP 阶段限定双源头：`HuggingFace (60%)` 代表结构化开箱即用数据；`GitHub (40%)` 代表半结构化复杂数据（需深度清洗）。
+- **职责**：作为数据获取的感知与路由中枢。接收自然语言或结构化查询，优先走标准化工具链路完成实时检索与候选组装。
+- **核心检索与路由策略（Semantic Routing & Function Calling）**：
+  - **严禁纯 Prompt 检索与动态执行**：绝不允许让大模型“凭空”生成 URL 以杜绝幻觉，也**绝对禁止**大模型在运行时动态编写并直接执行未知的爬虫代码。
+  - **分支 A（标准链路 / 工具命中，当前唯一启用）**：
+    1) LLM 只负责语义解析与函数参数生成（Function Calling）；  
+    2) 本地 Python Tool（`function_tools.py`）执行真实 API 调用（`api_clients/huggingface_api.py`、`api_clients/github_api.py`）；  
+    3) `source_selector.py` 按 `source_policy.json` 强制配比（MVP: HF 60% / GitHub 40%）并完成候选筛选；  
+    4) 输出统一结构化结果（真实 `repo_id/source_url`、可执行下载命令、校验元数据、样本文件 URI）。
+  - **分支 B（非标链路 / 工具缺失）**：**留空（TODO）**。当前版本不触发 `REQUIRE_NEW_TOOL`，仅在响应中标记 `branch_b.implemented=false`。
+- **数据源配比控制（Source Policy）**：
+  - 在标准链路中，必须通过配置文件 `source_policy.json` 强控数据源获取比例，不可由大模型自由发散。
+  - **MVP 阶段限定双源头**：`HuggingFace (60%)` 代表结构化开箱即用数据；`GitHub (40%)` 代表半结构化复杂数据（需深度清洗）。
 - **输入**：领域、语言、许可、配额策略等配置。
-- **输出**：带真实校验元数据的候选数据集清单及本地样本 URI。
+- **输出**：
+  - **常态输出（已实现）**：带真实校验元数据的候选数据集清单及本地样本 URI（交接给 UDatasets）。
+  - **路由输出（分支 B）**：暂未实现（保留占位）。
 
 ### 3.2 UDatasets（外部数据处理）
 
@@ -53,11 +60,12 @@
 - **默认注入路径**：`${EVAL_HOME:-/home/unlimitediw/workspace/eval}`
 - **职责**：对模型输出进行打分，产出包含质量、时延、鲁棒性的多维评估报告，并输出明确回归（Regression）信号。
 
-### 3.5 AI Coder（外部自愈服务）
+### 3.5 AI Coder（外部自愈与工具制造服务）
 
-- **调用方式**：`Cursor Admin API` / 独立 Sandbox Service
-- **职责（前置）**：接收 DataSearcher 产出的 sample，优先生成或更新 `UDatasets` 中的 data adapter。
-- **职责（后置）**：接收 Eval 负面反馈，迭代优化 adapter（必要时再扩展到清洗脚本与检索策略）。
+- **调用方式**：Cursor Admin API / 独立 Sandbox Service（强约束：仅限 PR/Diff 建议输出，需沙箱测试与人工审批）。
+- **职责（零步 / 边界拓展）**：接收 DataSearcher 发出的 `REQUIRE_NEW_TOOL` 契约，在隔离沙箱中编写针对新数据源的下载脚本（Spider / API Client），通过测试后提交 PR，扩充 DataSearcher 的本地工具箱。
+- **职责（前置 / 格式适配）**：接收 DataSearcher 成功获取的样本数据（Sample），优先分析其结构，并生成或更新 UDatasets 中的 Data Adapter（数据清洗与对齐脚本）。
+- **职责（后置 / 质量自愈）**：接收 Eval 模块的负面反馈（回归信号），迭代优化现有的 Adapter（必要时横向扩展修改清洗脚本与检索配比策略）。
 
 ## 4. 核心编排机制与状态存储规范
 
