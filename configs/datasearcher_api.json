@@ -17,6 +17,11 @@
     "retries": 2,
     "verify_hf_exists": true
   },
+  "selection": {
+    "recall_pool_size": 12000,
+    "download_size": 10
+  },
+  "recall_pool_output": "out/datasearcher/recall_pool.jsonl",
   "source_policy_file": "configs/source_policy.json",
   "source_policy": {
     "huggingface": 6,

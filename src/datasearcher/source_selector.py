@@ -87,9 +87,76 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
             "downloads": item.get("downloads"),
             "likes": item.get("likes"),
             "stars": item.get("stars"),
+            "size": item.get("size"),
+            "size_human": item.get("size_human"),
             "updated_at": item.get("updated_at"),
             "last_modified": item.get("last_modified"),
         },
+    }
+
+
+def _ratio_counts(total: int, source_policy: Dict[str, int]) -> Tuple[int, int]:
+    if total <= 0:
+        return 0, 0
+    hf_weight = max(int(source_policy.get("huggingface", 6)), 0)
+    gh_weight = max(int(source_policy.get("github", 4)), 0)
+    weight_sum = hf_weight + gh_weight
+    if weight_sum <= 0:
+        return total, 0
+    hf_target = int(round(total * hf_weight / weight_sum))
+    hf_target = max(0, min(hf_target, total))
+    gh_target = total - hf_target
+    return hf_target, gh_target
+
+
+def select_candidates_two_layer(
+    hf_candidates: List[Dict[str, Any]],
+    gh_candidates: List[Dict[str, Any]],
+    source_policy: Dict[str, int],
+    intent_text: str,
+    recall_pool_size: int,
+    download_size: int,
+) -> Dict[str, Any]:
+    notes: List[str] = []
+
+    recall_pool_size = max(1, int(recall_pool_size))
+    download_size = max(1, int(download_size))
+
+    hf_pool = _dedupe_by_repo(hf_candidates)
+    gh_pool = _dedupe_by_repo(gh_candidates)
+    hf_ranked = sorted(hf_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
+    gh_ranked = sorted(gh_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
+
+    hf_recall_need, gh_recall_need = _ratio_counts(recall_pool_size, source_policy)
+    hf_recall = hf_ranked[:hf_recall_need]
+    gh_recall = gh_ranked[:gh_recall_need]
+    recall_rows = hf_recall + gh_recall
+
+    if len(hf_recall) < hf_recall_need:
+        notes.append(f"recall层huggingface不足: 期望{hf_recall_need}, 实得{len(hf_recall)}")
+    if len(gh_recall) < gh_recall_need:
+        notes.append(f"recall层github不足: 期望{gh_recall_need}, 实得{len(gh_recall)}")
+
+    hf_download_need, gh_download_need = _ratio_counts(download_size, source_policy)
+    hf_download = hf_recall[:hf_download_need]
+    gh_download = gh_recall[:gh_download_need]
+    download_rows = hf_download + gh_download
+
+    if len(hf_download) < hf_download_need:
+        notes.append(f"download层huggingface不足: 期望{hf_download_need}, 实得{len(hf_download)}")
+    if len(gh_download) < gh_download_need:
+        notes.append(f"download层github不足: 期望{gh_download_need}, 实得{len(gh_download)}")
+
+    return {
+        "recall_pool": [
+            _normalize_selected_item(item, "In recall pool.")
+            for item in recall_rows
+        ],
+        "download_list": [
+            _normalize_selected_item(item, "Selected for download by semantic relevance and source policy.")
+            for item in download_rows
+        ],
+        "notes": notes,
     }
 
 

@@ -16,24 +16,32 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+
+def _log(msg: str) -> None:
+    """Print execution status to stderr (does not pollute JSON stdout)."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [DataSearcher] {msg}", file=sys.stderr)
+
 try:
     from .function_tools import execute_tool_call, get_tool_schemas
-    from .source_selector import select_candidates_by_policy
+    from .source_selector import select_candidates_two_layer
 except ImportError:  # pragma: no cover - direct script execution fallback
     from function_tools import execute_tool_call, get_tool_schemas
-    from source_selector import select_candidates_by_policy
+    from source_selector import select_candidates_two_layer
 
 DEFAULT_ALIYUN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ALIYUN_MODEL = "qwen-plus"
 DEFAULT_CONFIG_PATH = "configs/datasearcher_api.json"
 DEFAULT_SOURCE_POLICY = {"huggingface": 6, "github": 4}
 DEFAULT_OUTPUT_PATH = "out/datasearcher/sample.json"
+DEFAULT_RECALL_POOL_OUTPUT_PATH = "out/datasearcher/recall_pool.jsonl"
 DEFAULT_ALIYUN_API_KEY_FILE = ".secrets/alicloud_api_key.txt"
 
 
@@ -86,12 +94,37 @@ def _load_api_key_from_file(path: str) -> str:
         return ""
 
 
-def _render_prompt_template(prompt_template: str, source_policy: Dict[str, int]) -> str:
-    return (
+def _render_prompt_template(
+    prompt_template: str,
+    source_policy: Dict[str, int],
+    layer_cfg: Optional[Dict[str, int]] = None,
+) -> str:
+    rendered = (
         prompt_template.replace("{hf_count}", str(int(source_policy.get("huggingface", 6))))
         .replace("{gh_count}", str(int(source_policy.get("github", 4))))
-        .strip()
     )
+    if layer_cfg:
+        rendered = (
+            rendered.replace("{recall_pool_size}", str(int(layer_cfg.get("recall_pool_size", 120))))
+            .replace("{download_size}", str(int(layer_cfg.get("download_size", 10))))
+        )
+    return rendered.strip()
+
+
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, int]:
+    layer_cfg = cfg.get("selection") if isinstance(cfg.get("selection"), dict) else {}
+    return {
+        "recall_pool_size": max(1, int(layer_cfg.get("recall_pool_size", 120))),
+        "download_size": max(1, int(layer_cfg.get("download_size", 10))),
+    }
 
 
 def _post_json(
@@ -283,24 +316,45 @@ def _build_hf_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
     return [q for q in fallback if q and q.strip().lower() != normalized_initial]
 
 
+def _build_gh_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]:
+    seeds = _build_hf_fallback_queries(initial_query, raw_prompt)
+    out: List[str] = []
+    for seed in seeds:
+        out.append(f"{seed} language:python")
+        out.append(f"{seed} llm")
+    return out[:12]
+
+
 def _collect_candidates_from_tools(
     tool_calls: List[Dict[str, Any]],
     timeout_s: int,
     source_policy: Dict[str, int],
     raw_prompt: str,
+    recall_pool_size: int,
 ) -> Dict[str, Any]:
-    hf_need = int(source_policy.get("huggingface", 6))
+    total_weight = max(int(source_policy.get("huggingface", 6)) + int(source_policy.get("github", 4)), 1)
+    hf_need = max(1, int(round(recall_pool_size * int(source_policy.get("huggingface", 6)) / total_weight)))
+    gh_need = max(1, recall_pool_size - hf_need)
     hf_rows: List[Dict[str, Any]] = []
     gh_rows: List[Dict[str, Any]] = []
     saw_hf_call = False
+    saw_gh_call = False
     hf_primary_query = ""
+    gh_primary_query = ""
     hf_fallback_queries: List[str] = []
+    gh_fallback_queries: List[str] = []
 
     for call in tool_calls:
         fn = call.get("function") if isinstance(call.get("function"), dict) else {}
         name = str(fn.get("name", "")).strip()
         args = fn.get("arguments", "{}")
         parsed_args = _parse_tool_arguments(args)
+        if name == "search_huggingface_datasets":
+            parsed_args["limit"] = max(int(parsed_args.get("limit", 0) or 0), min(max(hf_need, 20), 100))
+        elif name == "search_github_repositories":
+            parsed_args["limit"] = max(int(parsed_args.get("limit", 0) or 0), min(max(gh_need, 20), 100))
+            parsed_args["sort"] = str(parsed_args.get("sort", "stars") or "stars")
+            parsed_args["order"] = str(parsed_args.get("order", "desc") or "desc")
         try:
             result = execute_tool_call(name, parsed_args, timeout_s=timeout_s)
         except Exception:
@@ -313,6 +367,8 @@ def _collect_candidates_from_tools(
             hf_primary_query = str(parsed_args.get("query", "")).strip()
             _merge_unique_candidates(hf_rows, [x for x in source_rows if isinstance(x, dict)])
         elif name == "search_github_repositories":
+            saw_gh_call = True
+            gh_primary_query = str(parsed_args.get("query", "")).strip()
             _merge_unique_candidates(gh_rows, [x for x in source_rows if isinstance(x, dict)])
 
     # HF fallback: when model query is too narrow or model didn't call HF tool.
@@ -320,12 +376,12 @@ def _collect_candidates_from_tools(
         fallback_seed_query = hf_primary_query if saw_hf_call else raw_prompt
         fallback_queries = _build_hf_fallback_queries(fallback_seed_query, raw_prompt)
         for q in fallback_queries:
-            if len(hf_rows) >= max(hf_need, 10):
+            if len(hf_rows) >= max(hf_need, 20):
                 break
             try:
                 fallback_result = execute_tool_call(
                     "search_huggingface_datasets",
-                    {"query": q, "limit": max(hf_need * 2, 10)},
+                    {"query": q, "limit": max(hf_need, 20)},
                     timeout_s=timeout_s,
                 )
             except Exception:
@@ -337,11 +393,35 @@ def _collect_candidates_from_tools(
             if added > 0:
                 hf_fallback_queries.append(q)
 
+    # GH fallback for larger recall pool.
+    if len(gh_rows) < gh_need:
+        fallback_seed_query = gh_primary_query if saw_gh_call else raw_prompt
+        fallback_queries = _build_gh_fallback_queries(fallback_seed_query, raw_prompt)
+        for q in fallback_queries:
+            if len(gh_rows) >= max(gh_need, 20):
+                break
+            try:
+                fallback_result = execute_tool_call(
+                    "search_github_repositories",
+                    {"query": q, "limit": max(gh_need, 20), "sort": "stars", "order": "desc"},
+                    timeout_s=timeout_s,
+                )
+            except Exception:
+                continue
+            rows = fallback_result.get("candidates", [])
+            if not isinstance(rows, list):
+                continue
+            added = _merge_unique_candidates(gh_rows, [x for x in rows if isinstance(x, dict)])
+            if added > 0:
+                gh_fallback_queries.append(q)
+
     return {
         "huggingface": hf_rows,
         "github": gh_rows,
         "hf_primary_query": hf_primary_query,
         "hf_fallback_queries": hf_fallback_queries,
+        "gh_primary_query": gh_primary_query,
+        "gh_fallback_queries": gh_fallback_queries,
     }
 
 
@@ -371,6 +451,9 @@ def run_datasearcher_branch_a(
     timeout_s: int,
     retries: int,
     source_policy: Dict[str, int],
+    recall_pool_size: int,
+    download_size: int,
+    recall_pool_output: str,
 ) -> Dict[str, Any]:
     resolved_provider = provider.strip().lower()
     headers: Dict[str, str] = {}
@@ -401,6 +484,7 @@ def run_datasearcher_branch_a(
         {"role": "user", "content": _build_user_prompt(prompt, source_policy)},
     ]
 
+    _log(f"Calling LLM ({resolved_provider}/{model_id}) for function-calling...")
     try:
         intent_resp = chat_with_retry(
             resolved_base_url,
@@ -416,6 +500,7 @@ def run_datasearcher_branch_a(
         return _response_envelope_failed("TRANSIENT_ERROR", f"Function-calling stage failed: {e}", retryable=True)
 
     tool_calls = _extract_tool_calls(intent_resp)
+    _log(f"Tool calls received: {len(tool_calls)}")
     if not tool_calls:
         # Branch B intentionally empty: no REQUIRE_NEW_TOOL emit yet.
         return _response_envelope_failed(
@@ -425,23 +510,34 @@ def run_datasearcher_branch_a(
             data={"branch_b": {"implemented": False, "status": "TODO"}},
         )
 
+    _log("Executing tool calls (HF/GitHub API)...")
     try:
         candidate_map = _collect_candidates_from_tools(
             tool_calls,
             timeout_s=timeout_s,
             source_policy=source_policy,
             raw_prompt=prompt,
+            recall_pool_size=recall_pool_size,
         )
         hf_rows = candidate_map["huggingface"]
         gh_rows = candidate_map["github"]
+        _log(f"Candidates collected: HF={len(hf_rows)}, GH={len(gh_rows)}")
         hf_primary_query = candidate_map.get("hf_primary_query", "")
         hf_fallback_queries = candidate_map.get("hf_fallback_queries", [])
-        selected, notes = select_candidates_by_policy(
+        gh_primary_query = candidate_map.get("gh_primary_query", "")
+        gh_fallback_queries = candidate_map.get("gh_fallback_queries", [])
+        layer_result = select_candidates_two_layer(
             hf_candidates=hf_rows,
             gh_candidates=gh_rows,
             source_policy=source_policy,
             intent_text=prompt,
+            recall_pool_size=recall_pool_size,
+            download_size=download_size,
         )
+        recall_pool = layer_result["recall_pool"]
+        selected = layer_result["download_list"]
+        notes = layer_result["notes"]
+        _log(f"Selection done: recall_pool={len(recall_pool)}, download_list={len(selected)}")
     except Exception as e:
         return _response_envelope_failed("SYSTEM_ERROR", f"Tool execution stage failed: {e}", retryable=False)
 
@@ -457,6 +553,13 @@ def run_datasearcher_branch_a(
             },
         )
 
+    try:
+        _write_jsonl(recall_pool_output, recall_pool)
+        _log(f"Wrote recall_pool to {recall_pool_output} ({len(recall_pool)} items)")
+    except Exception as e:
+        notes.append(f"recall_pool写入失败: {e}")
+        _log(f"WARN: recall_pool write failed: {e}")
+
     return _response_envelope_success(
         {
             "provider": resolved_provider,
@@ -464,6 +567,13 @@ def run_datasearcher_branch_a(
             "model_id": model_id,
             "source_policy": source_policy,
             "datasets": selected,
+            "download_list": selected,
+            "recall_pool": recall_pool,
+            "selection": {
+                "recall_pool_size": recall_pool_size,
+                "download_size": download_size,
+                "recall_pool_output": recall_pool_output,
+            },
             "semantic_router": {
                 "mode": "branch_a_only",
                 "branch_a": "enabled",
@@ -476,6 +586,8 @@ def run_datasearcher_branch_a(
                 "gh_candidates": len(gh_rows),
                 "hf_primary_query": hf_primary_query,
                 "hf_fallback_queries": hf_fallback_queries,
+                "gh_primary_query": gh_primary_query,
+                "gh_fallback_queries": gh_fallback_queries,
             },
         }
     )
@@ -494,6 +606,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=-1)
     parser.add_argument("--retries", type=int, default=-1)
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--recall-pool-output", default=DEFAULT_RECALL_POOL_OUTPUT_PATH)
     args = parser.parse_args()
 
     try:
@@ -508,6 +621,7 @@ def main() -> int:
     aliyun_cfg = providers_cfg.get("aliyun", {})
     req_cfg = cfg.get("request", {})
     source_policy = _load_source_policy(cfg)
+    layer_cfg = _load_layer_config(cfg)
 
     provider = (args.provider or os.getenv("PROVIDER") or cfg.get("default_provider") or "local").strip().lower()
     host = args.host or os.getenv("HOST") or str(local_cfg.get("host", "127.0.0.1"))
@@ -535,12 +649,18 @@ def main() -> int:
     if not prompt:
         prompt_file = str(cfg.get("prompt_file", "")).strip()
         if prompt_file:
-            prompt = _render_prompt_template(_load_text_file(prompt_file), source_policy)
+            prompt = _render_prompt_template(_load_text_file(prompt_file), source_policy, layer_cfg)
     if not prompt:
         prompt = "agentic code/data training dataset discovery"
 
     timeout_s = args.timeout if args.timeout >= 0 else int(os.getenv("TIMEOUT", str(req_cfg.get("timeout", 20))))
     retries = args.retries if args.retries >= 0 else int(os.getenv("RETRIES", str(req_cfg.get("retries", 2))))
+    recall_pool_size = int(os.getenv("RECALL_POOL_SIZE", str(layer_cfg["recall_pool_size"])))
+    download_size = int(os.getenv("DOWNLOAD_SIZE", str(layer_cfg["download_size"])))
+    recall_pool_output = args.recall_pool_output or str(cfg.get("recall_pool_output", DEFAULT_RECALL_POOL_OUTPUT_PATH))
+
+    _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}")
+    _log(f"Prompt: {prompt[:80]}..." if len(prompt) > 80 else f"Prompt: {prompt}")
 
     try:
         envelope = run_datasearcher_branch_a(
@@ -554,6 +674,9 @@ def main() -> int:
             timeout_s=timeout_s,
             retries=retries,
             source_policy=source_policy,
+            recall_pool_size=recall_pool_size,
+            download_size=download_size,
+            recall_pool_output=recall_pool_output,
         )
     except Exception as e:
         envelope = _response_envelope_failed("SYSTEM_ERROR", f"Unexpected failure: {e}", retryable=False)
@@ -562,9 +685,12 @@ def main() -> int:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+        _log(f"Wrote output to {args.output}")
 
+    status = envelope.get("status", "UNKNOWN")
+    _log(f"Done: status={status}")
     print(json.dumps(envelope, ensure_ascii=False, indent=2))
-    return 0 if envelope["status"] == "SUCCESS" else 1
+    return 0 if status == "SUCCESS" else 1
 
 
 if __name__ == "__main__":

@@ -74,6 +74,8 @@ def search_repositories(
                 "source_url": _safe_str(item.get("html_url")) or f"https://github.com/{repo_id}",
                 "license": license_name or "unknown",
                 "stars": item.get("stargazers_count"),
+                "size": item.get("size"),
+                "size_human": f"{item.get('size')} KB" if item.get("size") is not None else "unknown",
                 "updated_at": _safe_str(item.get("updated_at")),
                 "description": _safe_str(item.get("description"))[:500],
             }

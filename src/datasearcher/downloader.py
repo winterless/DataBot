@@ -11,6 +11,7 @@ DataSearcher Downloader — Download 步骤（按样本清单下载并校验）�
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -20,6 +21,11 @@ def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _log(msg: str) -> None:
+    """Print execution status to stderr (does not pollute report JSONL)."""
+    print(f"[{_now_ts()}] [Downloader] {msg}", file=sys.stderr)
+
+
 def _sanitize(name: str) -> str:
     return name.replace("/", "__")
 
@@ -27,6 +33,9 @@ def _sanitize(name: str) -> str:
 def _extract_from_json_obj(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return []
+
+    if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("download_list"), list):
+        return [x for x in obj["data"]["download_list"] if isinstance(x, dict)]
 
     if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("datasets"), list):
         return [x for x in obj["data"]["datasets"] if isinstance(x, dict)]
@@ -153,11 +162,41 @@ def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _index_key(source_type: str, repo_id: str) -> str:
+    return f"{source_type.strip().lower()}::{repo_id.strip()}"
+
+
+def load_download_index(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except Exception:
+                continue
+            source_type = str(row.get("source_type", "")).strip().lower()
+            repo_id = str(row.get("repo_id", "")).strip()
+            if not source_type or not repo_id:
+                continue
+            out[_index_key(source_type, repo_id)] = row
+    return out
+
+
+def append_download_index(path: Path, record: Dict[str, Any]) -> None:
+    append_jsonl(path, record)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download datasets from sample json/jsonl.")
     parser.add_argument("--sample", default="out/datasearcher/sample.jsonl")
     parser.add_argument("--target-dir", default="/home/unlimitediw/workspace/DataBot_dataset")
     parser.add_argument("--report", default="out/datasearcher/download_report.jsonl")
+    parser.add_argument("--download-index", default="state/datasearcher/download_index.jsonl")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--max-items", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
@@ -176,12 +215,17 @@ def main() -> int:
     target_root = Path(args.target_dir)
     target_root.mkdir(parents=True, exist_ok=True)
     report_path = Path(args.report)
+    download_index_path = Path(args.download_index)
+    download_index = load_download_index(download_index_path)
 
     datasets = load_samples(sample_path)
     if args.max_items > 0:
         datasets = datasets[: args.max_items]
 
-    print(f"[{_now_ts()}] Loaded {len(datasets)} datasets from {sample_path}")
+    _log(f"Starting: sample={sample_path}, target={target_root}, report={report_path}")
+    _log(f"Loaded {len(datasets)} datasets (index entries: {len(download_index)})")
+    if args.dry_run:
+        _log("DRY-RUN mode: no actual download")
     ok_count = 0
     fail_count = 0
     skip_count = 0
@@ -190,6 +234,27 @@ def main() -> int:
         source_type = str(item.get("source_type", "")).strip().lower()
         repo_id = str(item.get("repo_id", "")).strip()
         dataset_name = str(item.get("dataset_name", repo_id)).strip() or repo_id
+        key = _index_key(source_type, repo_id)
+
+        index_hit = download_index.get(key, {})
+        index_status = str(index_hit.get("status", "")).strip().lower()
+        index_path = Path(str(index_hit.get("path", "")).strip()) if index_hit.get("path") else None
+        if index_status == "success" and index_path and index_path.exists():
+            skip_count += 1
+            append_jsonl(
+                report_path,
+                {
+                    "ts": _now_ts(),
+                    "status": "success",
+                    "action": "skip_index_hit",
+                    "dataset_name": dataset_name,
+                    "source_type": source_type,
+                    "repo_id": repo_id,
+                    "path": str(index_path),
+                },
+            )
+            _log(f"[{idx}/{len(datasets)}] SKIP_INDEX {dataset_name}")
+            continue
         try:
             cmd, local_dir = build_download_cmd(item, target_root)
             verify_cmds = build_verify_cmds(item, local_dir)
@@ -206,14 +271,25 @@ def main() -> int:
                     "error": str(e),
                 },
             )
-            print(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {e}")
+            _log(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {e}")
             continue
 
         if local_dir.exists() and any(local_dir.iterdir()):
-            print(f"[{idx}/{len(datasets)}] VERIFY_EXISTING {dataset_name} ...")
+            _log(f"[{idx}/{len(datasets)}] VERIFY_EXISTING {dataset_name} ...")
             verified, failed_cmd, verify_err = run_verify_steps(verify_cmds)
             if verified:
                 skip_count += 1
+                index_record = {
+                    "ts": _now_ts(),
+                    "status": "success",
+                    "dataset_name": dataset_name,
+                    "source_type": source_type,
+                    "repo_id": repo_id,
+                    "path": str(local_dir),
+                    "action": "skip_existing",
+                }
+                download_index[key] = index_record
+                append_download_index(download_index_path, index_record)
                 append_jsonl(
                     report_path,
                     {
@@ -227,7 +303,7 @@ def main() -> int:
                         "verify_cmds": verify_cmds,
                     },
                 )
-                print(f"[{idx}/{len(datasets)}] SKIP+VERIFIED {dataset_name}")
+                _log(f"[{idx}/{len(datasets)}] SKIP+VERIFIED {dataset_name}")
             else:
                 fail_count += 1
                 append_jsonl(
@@ -244,12 +320,11 @@ def main() -> int:
                         "error": verify_err,
                     },
                 )
-                print(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
+                _log(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
             continue
 
         if args.dry_run:
-            print(f"[{idx}/{len(datasets)}] DRY-RUN {dataset_name}: {' '.join(cmd)}")
-            print(f"[{idx}/{len(datasets)}] DRY-RUN VERIFY {dataset_name}: {' ; '.join(' '.join(x) for x in verify_cmds)}")
+            _log(f"[{idx}/{len(datasets)}] DRY-RUN {dataset_name}: {' '.join(cmd)}")
             append_jsonl(
                 report_path,
                 {
@@ -265,13 +340,24 @@ def main() -> int:
             )
             continue
 
-        print(f"[{idx}/{len(datasets)}] DOWNLOADING {dataset_name} ...")
+        _log(f"[{idx}/{len(datasets)}] DOWNLOADING {dataset_name} ...")
         ok, err = run_with_retry(cmd, retries=args.retries)
         if ok:
             print(f"[{idx}/{len(datasets)}] VERIFYING {dataset_name} ...")
             verified, failed_cmd, verify_err = run_verify_steps(verify_cmds)
             if verified:
                 ok_count += 1
+                index_record = {
+                    "ts": _now_ts(),
+                    "status": "success",
+                    "dataset_name": dataset_name,
+                    "source_type": source_type,
+                    "repo_id": repo_id,
+                    "path": str(local_dir),
+                    "action": "downloaded",
+                }
+                download_index[key] = index_record
+                append_download_index(download_index_path, index_record)
                 append_jsonl(
                     report_path,
                     {
@@ -285,7 +371,7 @@ def main() -> int:
                         "path": str(local_dir),
                     },
                 )
-                print(f"[{idx}/{len(datasets)}] OK+VERIFIED {dataset_name}")
+                _log(f"[{idx}/{len(datasets)}] OK+VERIFIED {dataset_name}")
             else:
                 fail_count += 1
                 append_jsonl(
@@ -303,7 +389,7 @@ def main() -> int:
                         "error": verify_err,
                     },
                 )
-                print(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
+                _log(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
         else:
             fail_count += 1
             append_jsonl(
@@ -320,11 +406,9 @@ def main() -> int:
                     "error": err,
                 },
             )
-            print(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {err}")
+            _log(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {err}")
 
-    print(
-        f"[{_now_ts()}] Done. success={ok_count}, failed={fail_count}, skipped={skip_count}, total={len(datasets)}"
-    )
+    _log(f"Done: success={ok_count}, failed={fail_count}, skipped={skip_count}, total={len(datasets)}")
     return 0 if fail_count == 0 else 1
 
 

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 API="${API:-aliyun}"   # export API=local to use local provider
-MODE="${MODE:-all}"    # search | download | all
+MODE="${MODE:-search}"    # search | download | all
 
 mkdir -p out/datasearcher
 case "${MODE}" in

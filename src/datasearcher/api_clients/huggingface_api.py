@@ -29,6 +29,18 @@ def _safe_str(value: Any) -> str:
     return str(value).strip()
 
 
+def _extract_hf_size(card_data: Dict[str, Any]) -> str:
+    size_val = card_data.get("dataset_size")
+    if isinstance(size_val, str) and size_val.strip():
+        return size_val.strip()
+    categories = card_data.get("size_categories")
+    if isinstance(categories, list):
+        names = [str(x).strip() for x in categories if str(x).strip()]
+        if names:
+            return ",".join(names[:3])
+    return ""
+
+
 def search_datasets(query: str, limit: int = 20, timeout_s: int = 20) -> List[Dict[str, Any]]:
     q = _safe_str(query)
     if not q:
@@ -50,6 +62,7 @@ def search_datasets(query: str, limit: int = 20, timeout_s: int = 20) -> List[Di
             continue
         card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
         license_name = _safe_str(card_data.get("license")) or _safe_str(item.get("license"))
+        size_human = _extract_hf_size(card_data)
         out.append(
             {
                 "dataset_name": repo_id.split("/")[-1],
@@ -59,6 +72,8 @@ def search_datasets(query: str, limit: int = 20, timeout_s: int = 20) -> List[Di
                 "license": license_name or "unknown",
                 "downloads": item.get("downloads"),
                 "likes": item.get("likes"),
+                "size": None,
+                "size_human": size_human or "unknown",
                 "last_modified": _safe_str(item.get("lastModified")),
                 "description": _safe_str(item.get("description"))[:500],
             }

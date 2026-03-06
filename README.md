@@ -2,6 +2,25 @@
 
 ![DataBot Graph](docs/graph.png)
 
+## 执行状态日志（Execution Status Logs）
+
+各环节运行时会在终端打印执行状态，便于观察进度与排查问题：
+
+- **DataSearcher (client.py)**：启动参数、LLM 调用、工具执行、候选数量、recall_pool 写入、最终状态
+- **Downloader (downloader.py)**：样本加载、每项下载/校验/跳过状态、汇总统计
+
+日志输出到 **stderr**，不影响 JSON 等结构化输出到 stdout 的管道重定向。示例：
+
+```bash
+# 状态日志与 JSON 均输出到终端
+MODE=search API=aliyun ./smoke_datasearcher.sh
+
+# 将状态日志单独保存，JSON 输出到文件
+python src/datasearcher/client.py --api aliyun 2>logs/datasearcher.log --output out/datasearcher/sample.json
+```
+
+---
+
 # DataBot Pipeline Architecture
 
 ## 1. 目标与系统定位
