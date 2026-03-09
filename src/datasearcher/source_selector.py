@@ -3,7 +3,33 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _in_preferred_size(
+    item: Dict[str, Any],
+    preferred: Optional[Dict[str, Any]],
+) -> bool:
+    """Return True if item passes preferred_size filter (or no filter)."""
+    if not preferred:
+        return True
+    source_type = str(item.get("source_type", "")).lower()
+    if source_type == "huggingface":
+        return True
+    if source_type == "github":
+        min_mb = float(preferred.get("min_mb", 0))
+        max_mb = float(preferred.get("max_mb", 0)) or 10**6
+        if min_mb <= 0 and max_mb >= 10**6:
+            return True
+        size_kb = item.get("size")
+        if size_kb is None:
+            return True
+        try:
+            size_mb = int(size_kb) / 1024.0
+        except (TypeError, ValueError):
+            return True
+        return min_mb <= size_mb <= max_mb
+    return True
 
 
 def _sanitize_local_name(repo_id: str) -> str:
@@ -116,6 +142,7 @@ def select_candidates_two_layer(
     intent_text: str,
     recall_pool_size: int,
     download_size: int,
+    preferred_size: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     notes: List[str] = []
 
@@ -124,6 +151,14 @@ def select_candidates_two_layer(
 
     hf_pool = _dedupe_by_repo(hf_candidates)
     gh_pool = _dedupe_by_repo(gh_candidates)
+    if preferred_size:
+        hf_before, gh_before = len(hf_pool), len(gh_pool)
+        hf_pool = [x for x in hf_pool if _in_preferred_size(x, preferred_size)]
+        gh_pool = [x for x in gh_pool if _in_preferred_size(x, preferred_size)]
+        dropped_hf, dropped_gh = hf_before - len(hf_pool), gh_before - len(gh_pool)
+        if dropped_hf or dropped_gh:
+            notes.append(f"preferred_size过滤: HF剔除{dropped_hf}, GH剔除{dropped_gh}")
+
     hf_ranked = sorted(hf_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
     gh_ranked = sorted(gh_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
 

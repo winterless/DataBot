@@ -19,9 +19,14 @@
   },
   "selection": {
     "recall_pool_size": 12000,
-    "download_size": 10
+    "download_size": 10,
+    "preferred_size": {
+      "min_mb": 1000,
+      "max_mb": 50000
+    }
   },
   "recall_pool_output": "out/datasearcher/recall_pool.jsonl",
+  "llm_trace_output": "out/datasearcher/llm_trace.json",
   "source_policy_file": "configs/source_policy.json",
   "source_policy": {
     "huggingface": 6,

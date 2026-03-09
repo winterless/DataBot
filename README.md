@@ -19,6 +19,45 @@ MODE=search API=aliyun ./smoke_datasearcher.sh
 python src/datasearcher/client.py --api aliyun 2>logs/datasearcher.log --output out/datasearcher/sample.json
 ```
 
+## DataSearcher Search 模式调用栈
+
+`MODE=search` 时（`python src/datasearcher/client.py`）的调用关系：
+
+```
+main()                                    # client.py:641
+└── run_datasearcher_branch_a()           # client.py:448
+    ├── get_model_id()                    # client.py:160  [仅 local provider]
+    ├── _build_intent_system_prompt()     # client.py:233
+    ├── _build_user_prompt()              # client.py:245
+    ├── chat_with_retry()                 # client.py:171
+    │   └── _post_json()                  # client.py:135  → HTTP POST /v1/chat/completions
+    ├── get_tool_schemas()                # function_tools.py:20
+    ├── _extract_tool_calls()             # client.py:226
+    ├── _collect_candidates_from_tools()  # client.py:333
+    │   ├── _parse_tool_arguments()        # client.py:254
+    │   ├── execute_tool_call()           # function_tools.py:92
+    │   │   ├── search_datasets()          # api_clients/huggingface_api.py:44
+    │   │   │   └── _get_json()           # huggingface_api.py:13  → HF API
+    │   │   └── search_repositories()     # api_clients/github_api.py:33
+    │   │       └── _get_json()           # github_api.py:13  → GitHub API
+    │   ├── _merge_unique_candidates()    # client.py:272
+    │   ├── _build_hf_fallback_queries()  # client.py:287
+    │   ├── _build_gh_fallback_queries()  # client.py:324
+    │   └── execute_tool_call()           # [fallback 时再次调用]
+    ├── select_candidates_two_layer()     # source_selector.py:138
+    │   ├── _dedupe_by_repo()             # source_selector.py:81
+    │   ├── _in_preferred_size()          # source_selector.py:9
+    │   ├── _score_candidate()            # source_selector.py:56
+    │   ├── _ratio_counts()               # source_selector.py:124
+    │   └── _normalize_selected_item()    # source_selector.py:93
+    │       ├── canonical_hf_download_command()   # source_selector.py:39
+    │       └── canonical_github_download_command() # source_selector.py:47
+    ├── _write_jsonl()                    # client.py:115  → recall_pool.jsonl
+    └── _response_envelope_success()      # client.py:49
+```
+
+**外部依赖**：`_post_json` → DashScope/本地 vLLM；`huggingface_api._get_json` → HF API；`github_api._get_json` → GitHub API。
+
 ---
 
 # DataBot Pipeline Architecture

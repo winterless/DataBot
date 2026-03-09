@@ -42,6 +42,7 @@ DEFAULT_CONFIG_PATH = "configs/datasearcher_api.json"
 DEFAULT_SOURCE_POLICY = {"huggingface": 6, "github": 4}
 DEFAULT_OUTPUT_PATH = "out/datasearcher/sample.json"
 DEFAULT_RECALL_POOL_OUTPUT_PATH = "out/datasearcher/recall_pool.jsonl"
+DEFAULT_LLM_TRACE_OUTPUT_PATH = "out/datasearcher/llm_trace.json"
 DEFAULT_ALIYUN_API_KEY_FILE = ".secrets/alicloud_api_key.txt"
 
 
@@ -119,12 +120,16 @@ def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, int]:
+def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     layer_cfg = cfg.get("selection") if isinstance(cfg.get("selection"), dict) else {}
-    return {
+    out: Dict[str, Any] = {
         "recall_pool_size": max(1, int(layer_cfg.get("recall_pool_size", 120))),
         "download_size": max(1, int(layer_cfg.get("download_size", 10))),
     }
+    pref = layer_cfg.get("preferred_size")
+    if isinstance(pref, dict):
+        out["preferred_size"] = pref
+    return out
 
 
 def _post_json(
@@ -454,6 +459,8 @@ def run_datasearcher_branch_a(
     recall_pool_size: int,
     download_size: int,
     recall_pool_output: str,
+    preferred_size: Optional[Dict[str, Any]] = None,
+    llm_trace_output: Optional[str] = None,
 ) -> Dict[str, Any]:
     resolved_provider = provider.strip().lower()
     headers: Dict[str, str] = {}
@@ -499,6 +506,37 @@ def run_datasearcher_branch_a(
     except Exception as e:
         return _response_envelope_failed("TRANSIENT_ERROR", f"Function-calling stage failed: {e}", retryable=True)
 
+    usage = intent_resp.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+    chat_url = _api_url(resolved_base_url, "/chat/completions")
+    _log(f"LLM usage: url={chat_url}, prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, total_tokens={total_tokens}")
+
+    if llm_trace_output:
+        try:
+            trace_obj = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "prompt": {
+                    "messages": intent_messages,
+                    "tools": get_tool_schemas(),
+                    "tool_choice": "auto",
+                },
+                "response": intent_resp,
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+                "tool_calls": _extract_tool_calls(intent_resp),
+            }
+            trace_path = Path(llm_trace_output)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_path.write_text(json.dumps(trace_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+            _log(f"Wrote LLM trace to {llm_trace_output}")
+        except Exception as e:
+            _log(f"WARN: llm_trace write failed: {e}")
+
     tool_calls = _extract_tool_calls(intent_resp)
     _log(f"Tool calls received: {len(tool_calls)}")
     if not tool_calls:
@@ -533,6 +571,7 @@ def run_datasearcher_branch_a(
             intent_text=prompt,
             recall_pool_size=recall_pool_size,
             download_size=download_size,
+            preferred_size=preferred_size,
         )
         recall_pool = layer_result["recall_pool"]
         selected = layer_result["download_list"]
@@ -573,6 +612,7 @@ def run_datasearcher_branch_a(
                 "recall_pool_size": recall_pool_size,
                 "download_size": download_size,
                 "recall_pool_output": recall_pool_output,
+                "preferred_size": preferred_size,
             },
             "semantic_router": {
                 "mode": "branch_a_only",
@@ -588,6 +628,11 @@ def run_datasearcher_branch_a(
                 "hf_fallback_queries": hf_fallback_queries,
                 "gh_primary_query": gh_primary_query,
                 "gh_fallback_queries": gh_fallback_queries,
+                "llm_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
             },
         }
     )
@@ -658,8 +703,12 @@ def main() -> int:
     recall_pool_size = int(os.getenv("RECALL_POOL_SIZE", str(layer_cfg["recall_pool_size"])))
     download_size = int(os.getenv("DOWNLOAD_SIZE", str(layer_cfg["download_size"])))
     recall_pool_output = args.recall_pool_output or str(cfg.get("recall_pool_output", DEFAULT_RECALL_POOL_OUTPUT_PATH))
+    preferred_size = layer_cfg.get("preferred_size") if isinstance(layer_cfg.get("preferred_size"), dict) else None
+    llm_trace_output = str(cfg.get("llm_trace_output", DEFAULT_LLM_TRACE_OUTPUT_PATH)).strip() or DEFAULT_LLM_TRACE_OUTPUT_PATH
 
     _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}")
+    if preferred_size:
+        _log(f"preferred_size: min_mb={preferred_size.get('min_mb')}, max_mb={preferred_size.get('max_mb')}")
     _log(f"Prompt: {prompt[:80]}..." if len(prompt) > 80 else f"Prompt: {prompt}")
 
     try:
@@ -677,6 +726,8 @@ def main() -> int:
             recall_pool_size=recall_pool_size,
             download_size=download_size,
             recall_pool_output=recall_pool_output,
+            preferred_size=preferred_size,
+            llm_trace_output=llm_trace_output,
         )
     except Exception as e:
         envelope = _response_envelope_failed("SYSTEM_ERROR", f"Unexpected failure: {e}", retryable=False)
