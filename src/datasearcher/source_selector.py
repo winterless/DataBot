@@ -288,13 +288,14 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
 
 
 def _ratio_counts(total: int, source_policy: Dict[str, int]) -> Tuple[int, int]:
+    """Split total by source_policy weights (percentage). Weight=0 disables that source."""
     if total <= 0:
         return 0, 0
     hf_weight = max(int(source_policy.get("huggingface", 6)), 0)
     gh_weight = max(int(source_policy.get("github", 4)), 0)
     weight_sum = hf_weight + gh_weight
     if weight_sum <= 0:
-        return total, 0
+        return 0, 0
     hf_target = int(round(total * hf_weight / weight_sum))
     hf_target = max(0, min(hf_target, total))
     gh_target = total - hf_target

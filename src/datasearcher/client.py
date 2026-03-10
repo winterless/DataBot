@@ -31,7 +31,7 @@ def _log(msg: str) -> None:
 
 try:
     from .function_tools import execute_tool_call, get_tool_schemas
-    from .source_selector import select_candidates_two_layer
+    from .source_selector import select_candidates_two_layer, _ratio_counts
     from .api_clients.huggingface_api import (
         search_datasets_recent,
         list_datasets_by_author,
@@ -49,7 +49,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script execution fallback
     from function_tools import execute_tool_call, get_tool_schemas
-    from source_selector import select_candidates_two_layer
+    from source_selector import select_candidates_two_layer, _ratio_counts
     from api_clients.huggingface_api import (
         search_datasets_recent,
         list_datasets_by_author,
@@ -275,24 +275,35 @@ def _extract_tool_calls(chat_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _build_intent_system_prompt(source_policy: Dict[str, int]) -> str:
-    hf_need = int(source_policy.get("huggingface", 6))
-    gh_need = int(source_policy.get("github", 4))
+    hf_w = int(source_policy.get("huggingface", 6))
+    gh_w = int(source_policy.get("github", 4))
+    parts = []
+    if hf_w > 0:
+        parts.append(f"huggingface={hf_w}")
+    if gh_w > 0:
+        parts.append(f"github={gh_w}")
+    ratio_str = ", ".join(parts) if parts else "huggingface=6, github=4"
     return (
         "You are DataSearcher semantic router. "
         "You MUST discover real data sources only via tool calls. "
         "Never fabricate URL/repo_id. "
-        f"Target ratio: huggingface={hf_need}, github={gh_need}. "
+        f"Target ratio: {ratio_str}. "
         "Call tools first, then stop."
     )
 
 
 def _build_user_prompt(raw_prompt: str, source_policy: Dict[str, int]) -> str:
-    hf_need = int(source_policy.get("huggingface", 6))
-    gh_need = int(source_policy.get("github", 4))
-    return (
-        f"需求: {raw_prompt}\n"
-        f"请分别调用 HuggingFace 与 GitHub 工具检索候选，目标配比 HF={hf_need}, GH={gh_need}。"
-    )
+    hf_w = int(source_policy.get("huggingface", 6))
+    gh_w = int(source_policy.get("github", 4))
+    if hf_w > 0 and gh_w > 0:
+        line = f"请分别调用 HuggingFace 与 GitHub 工具检索候选，目标配比 HF={hf_w}, GH={gh_w}。"
+    elif hf_w > 0:
+        line = f"请调用 HuggingFace 工具检索候选，尽量扩大召回覆盖面（配比 HF={hf_w}）。"
+    elif gh_w > 0:
+        line = f"请调用 GitHub 工具检索候选，尽量扩大召回覆盖面（配比 GH={gh_w}）。"
+    else:
+        line = "请调用 HuggingFace 与 GitHub 工具检索候选。"
+    return f"需求: {raw_prompt}\n{line}"
 
 
 def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
@@ -439,34 +450,41 @@ def _run_deep_scan(
     hf_primary_query: str,
     gh_primary_query: str,
     deep_scan_cfg: Optional[Dict[str, Any]],
+    source_policy: Optional[Dict[str, int]] = None,
 ) -> None:
     """Deep scan: code search, HF tags, pagination, README link extraction."""
     if not deep_scan_cfg or not deep_scan_cfg.get("enabled"):
         return
+    policy = source_policy or {}
+    hf_on = int(policy.get("huggingface", 6)) > 0
+    gh_on = int(policy.get("github", 4)) > 0
+
     cfg = deep_scan_cfg
     max_pages = int(cfg.get("max_pages", 5))
     readme_sample = int(cfg.get("readme_sample_size", 30))
     code_search_limit = int(cfg.get("code_search_limit", 50))
 
-    try:
-        domain_kw = _extract_domain_keywords(hf_primary_query, gh_primary_query)
-        added = _merge_unique_candidates(
-            gh_rows,
-            search_code_for_data_repos(code_search_limit, timeout_s, domain_keywords=domain_kw),
-        )
-        if added:
-            _log(f"Deep scan: code search (domain={domain_kw or 'generic'}): +{added}")
-    except Exception as e:
-        _log(f"WARN: Code search failed: {e}")
+    if gh_on:
+        try:
+            domain_kw = _extract_domain_keywords(hf_primary_query, gh_primary_query)
+            added = _merge_unique_candidates(
+                gh_rows,
+                search_code_for_data_repos(code_search_limit, timeout_s, domain_keywords=domain_kw),
+            )
+            if added:
+                _log(f"Deep scan: code search (domain={domain_kw or 'generic'}): +{added}")
+        except Exception as e:
+            _log(f"WARN: Code search failed: {e}")
 
-    try:
-        added = _merge_unique_candidates(hf_rows, search_datasets_by_tags(limit_per_tag=50, timeout_s=timeout_s))
-        if added:
-            _log(f"Deep scan: HF semantic tags: +{added}")
-    except Exception as e:
-        _log(f"WARN: HF tag search failed: {e}")
+    if hf_on:
+        try:
+            added = _merge_unique_candidates(hf_rows, search_datasets_by_tags(limit_per_tag=50, timeout_s=timeout_s))
+            if added:
+                _log(f"Deep scan: HF semantic tags: +{added}")
+        except Exception as e:
+            _log(f"WARN: HF tag search failed: {e}")
 
-    if gh_primary_query.strip() and max_pages > 1:
+    if gh_on and gh_primary_query.strip() and max_pages > 1:
         try:
             extra = search_repositories(
                 gh_primary_query,
@@ -507,8 +525,8 @@ def _run_deep_scan(
 
     if linked:
         stubs = [_stub_from_repo_id(src, rid) for src, rid in linked]
-        added_hf = _merge_unique_candidates(hf_rows, [s for s in stubs if s.get("source_type") == "huggingface"])
-        added_gh = _merge_unique_candidates(gh_rows, [s for s in stubs if s.get("source_type") == "github"])
+        added_hf = _merge_unique_candidates(hf_rows, [s for s in stubs if s.get("source_type") == "huggingface"]) if hf_on else 0
+        added_gh = _merge_unique_candidates(gh_rows, [s for s in stubs if s.get("source_type") == "github"]) if gh_on else 0
         if added_hf or added_gh:
             _log(f"Deep scan: README links (HF +{added_hf}, GH +{added_gh})")
 
@@ -523,13 +541,18 @@ def _run_time_sweep_and_seed_orgs(
     gh_primary_query: str,
     raw_prompt: str,
     sweep_limits: Optional[Dict[str, int]] = None,
+    source_policy: Optional[Dict[str, int]] = None,
 ) -> None:
     """Merge time-sweep and seed-org results (LLM-driven params only) into hf_rows/gh_rows."""
+    policy = source_policy or {}
+    hf_on = int(policy.get("huggingface", 6)) > 0
+    gh_on = int(policy.get("github", 4)) > 0
+
     limits = sweep_limits or {}
     hf_limit = int(limits.get("hf_limit", 100))
     gh_limit = int(limits.get("gh_limit", 150))
 
-    if suggested_created_after:
+    if gh_on and suggested_created_after:
         base_q = gh_primary_query.strip() or " ".join(re.split(r"[^a-zA-Z0-9_-]+", raw_prompt)[:3])
         if not base_q:
             base_q = "dataset"
@@ -543,29 +566,29 @@ def _run_time_sweep_and_seed_orgs(
         except Exception as e:
             _log(f"WARN: GH time-sweep failed: {e}")
 
-    hf_sweep_queries = [q for q in [hf_primary_query.strip()] if q]
-    if not hf_sweep_queries and raw_prompt:
-        tokens = [t for t in re.split(r"[^a-zA-Z0-9_-]+", raw_prompt.lower()) if len(t) >= 3][:3]
-        hf_sweep_queries = tokens or ["dataset"]
-    if suggested_created_after and hf_sweep_queries:
-        try:
-            for q in hf_sweep_queries[:2]:
-                added = _merge_unique_candidates(hf_rows, search_datasets_recent(q, hf_limit, timeout_s))
+    if hf_on:
+        hf_sweep_queries = [q for q in [hf_primary_query.strip()] if q]
+        if not hf_sweep_queries and raw_prompt:
+            tokens = [t for t in re.split(r"[^a-zA-Z0-9_-]+", raw_prompt.lower()) if len(t) >= 3][:3]
+            hf_sweep_queries = tokens or ["dataset"]
+        if suggested_created_after and hf_sweep_queries:
+            try:
+                for q in hf_sweep_queries[:2]:
+                    added = _merge_unique_candidates(hf_rows, search_datasets_recent(q, hf_limit, timeout_s))
+                    if added:
+                        _log(f"Time-sweep HF (sort=createdAt, q={q}): +{added}")
+            except Exception as e:
+                _log(f"WARN: HF time-sweep failed: {e}")
+        for org in dynamic_seed_orgs:
+            org = str(org).strip()
+            if not org:
+                continue
+            try:
+                added = _merge_unique_candidates(hf_rows, list_datasets_by_author(org, 100, timeout_s))
                 if added:
-                    _log(f"Time-sweep HF (sort=createdAt, q={q}): +{added}")
-        except Exception as e:
-            _log(f"WARN: HF time-sweep failed: {e}")
-
-    for org in dynamic_seed_orgs:
-        org = str(org).strip()
-        if not org:
-            continue
-        try:
-            added = _merge_unique_candidates(hf_rows, list_datasets_by_author(org, 100, timeout_s))
-            if added:
-                _log(f"Seed org {org}: +{added}")
-        except Exception as e:
-            _log(f"WARN: Seed org {org} failed: {e}")
+                    _log(f"Seed org {org}: +{added}")
+            except Exception as e:
+                _log(f"WARN: Seed org {org} failed: {e}")
 
 
 def _collect_candidates_from_tools(
@@ -577,9 +600,7 @@ def _collect_candidates_from_tools(
     sweep_limits: Optional[Dict[str, int]] = None,
     deep_scan_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    total_weight = max(int(source_policy.get("huggingface", 6)) + int(source_policy.get("github", 4)), 1)
-    hf_need = max(1, int(round(recall_pool_size * int(source_policy.get("huggingface", 6)) / total_weight)))
-    gh_need = max(1, recall_pool_size - hf_need)
+    hf_need, gh_need = _ratio_counts(recall_pool_size, source_policy)
     hf_rows: List[Dict[str, Any]] = []
     gh_rows: List[Dict[str, Any]] = []
     saw_hf_call = False
@@ -632,7 +653,7 @@ def _collect_candidates_from_tools(
             _merge_unique_candidates(gh_rows, [x for x in source_rows if isinstance(x, dict)])
 
     # HF fallback: when model query is too narrow or model didn't call HF tool.
-    if len(hf_rows) < hf_need:
+    if hf_need > 0 and len(hf_rows) < hf_need:
         fallback_seed_query = hf_primary_query if saw_hf_call else raw_prompt
         fallback_queries = _build_hf_fallback_queries(fallback_seed_query, raw_prompt)
         for q in fallback_queries:
@@ -654,7 +675,7 @@ def _collect_candidates_from_tools(
                 hf_fallback_queries.append(q)
 
     # GH fallback for larger recall pool.
-    if len(gh_rows) < gh_need:
+    if gh_need > 0 and len(gh_rows) < gh_need:
         fallback_seed_query = gh_primary_query if saw_gh_call else raw_prompt
         fallback_queries = _build_gh_fallback_queries(fallback_seed_query, raw_prompt)
         for q in fallback_queries:
@@ -680,6 +701,7 @@ def _collect_candidates_from_tools(
         hf_primary_query=hf_primary_query,
         gh_primary_query=gh_primary_query,
         deep_scan_cfg=deep_scan_cfg,
+        source_policy=source_policy,
     )
 
     _run_time_sweep_and_seed_orgs(
@@ -690,6 +712,7 @@ def _collect_candidates_from_tools(
         gh_primary_query=gh_primary_query,
         raw_prompt=raw_prompt,
         sweep_limits=sweep_limits,
+        source_policy=source_policy,
     )
 
     return {
@@ -705,14 +728,15 @@ def _collect_candidates_from_tools(
 
 
 def _load_source_policy(cfg: Dict[str, Any]) -> Dict[str, int]:
-    inline_policy = cfg.get("source_policy") if isinstance(cfg.get("source_policy"), dict) else {}
+    """Load source_policy: inline in cfg is primary; optional source_policy_file extends/overrides."""
+    policy: Dict[str, Any] = {}
     policy_file = str(cfg.get("source_policy_file", "")).strip()
-
-    policy: Dict[str, Any] = dict(inline_policy)
     if policy_file:
         path = Path(policy_file)
         if path.exists():
-            policy = json.loads(path.read_text(encoding="utf-8"))
+            policy = dict(json.loads(path.read_text(encoding="utf-8")))
+    inline = cfg.get("source_policy") if isinstance(cfg.get("source_policy"), dict) else {}
+    policy.update(inline)  # inline takes precedence
     return {
         "huggingface": int(policy.get("huggingface", DEFAULT_SOURCE_POLICY["huggingface"])),
         "github": int(policy.get("github", DEFAULT_SOURCE_POLICY["github"])),
@@ -776,7 +800,7 @@ def run_datasearcher_branch_a(
             timeout_s=timeout_s,
             retries=retries,
             headers=headers,
-            tools=get_tool_schemas(),
+            tools=get_tool_schemas(source_policy),
             tool_choice="auto",
         )
     except Exception as e:
@@ -795,7 +819,7 @@ def run_datasearcher_branch_a(
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "prompt": {
                     "messages": intent_messages,
-                    "tools": get_tool_schemas(),
+                    "tools": get_tool_schemas(source_policy),
                     "tool_choice": "auto",
                 },
                 "response": intent_resp,

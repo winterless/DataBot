@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     from .api_clients.github_api import search_repositories
@@ -18,9 +18,22 @@ TOOL_SEARCH_GH = "search_github_repositories"
 TOOL_SET_DISCOVERY_PARAMS = "set_discovery_parameters"
 
 
-def get_tool_schemas() -> List[Dict[str, Any]]:
-    return [
-        {
+def _source_enabled(source_policy: Dict[str, Any], source: str) -> bool:
+    """Return True if source has weight > 0."""
+    return int(source_policy.get(source, 0)) > 0
+
+
+def get_tool_schemas(source_policy: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Return tool schemas. When source_policy given, only include tools for enabled sources (weight>0)."""
+    policy = source_policy or {}
+    hf_on = _source_enabled(policy, "huggingface")
+    gh_on = _source_enabled(policy, "github")
+    if not hf_on and not gh_on:
+        hf_on, gh_on = True, True  # fallback: both enabled when both 0
+
+    schemas: List[Dict[str, Any]] = []
+    if hf_on:
+        schemas.append({
             "type": "function",
             "function": {
                 "name": TOOL_SEARCH_HF,
@@ -43,8 +56,9 @@ def get_tool_schemas() -> List[Dict[str, Any]]:
                     "additionalProperties": False,
                 },
             },
-        },
-        {
+        })
+    if gh_on:
+        schemas.append({
             "type": "function",
             "function": {
                 "name": TOOL_SEARCH_GH,
@@ -81,31 +95,31 @@ def get_tool_schemas() -> List[Dict[str, Any]]:
                     "additionalProperties": False,
                 },
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": TOOL_SET_DISCOVERY_PARAMS,
-                "description": "Set dynamic discovery parameters based on the query domain. Call this (optionally) to enable org-based scan and time filtering.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dynamic_seed_orgs": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "3-5 authoritative orgs/authors in this domain for HuggingFace author-based queries. Empty if not applicable.",
-                        },
-                        "suggested_created_after": {
-                            "type": ["string", "null"],
-                            "description": "ISO date (YYYY-MM-DD) for GitHub created:> filter if the tech is recent; null if no time filter needed.",
-                        },
+        })
+    schemas.append({
+        "type": "function",
+        "function": {
+            "name": TOOL_SET_DISCOVERY_PARAMS,
+            "description": "Set dynamic discovery parameters based on the query domain. Call this (optionally) to enable org-based scan and time filtering.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dynamic_seed_orgs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "3-5 authoritative orgs/authors in this domain for HuggingFace author-based queries. Empty if not applicable.",
                     },
-                    "required": ["dynamic_seed_orgs", "suggested_created_after"],
-                    "additionalProperties": False,
+                    "suggested_created_after": {
+                        "type": ["string", "null"],
+                        "description": "ISO date (YYYY-MM-DD) for GitHub created:> filter if the tech is recent; null if no time filter needed.",
+                    },
                 },
+                "required": ["dynamic_seed_orgs", "suggested_created_after"],
+                "additionalProperties": False,
             },
         },
-    ]
+    })
+    return schemas
 
 
 def _parse_arguments(arguments: Any) -> Dict[str, Any]:
