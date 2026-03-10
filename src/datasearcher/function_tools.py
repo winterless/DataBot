@@ -70,6 +70,12 @@ def get_tool_schemas() -> List[Dict[str, Any]]:
                             "type": "string",
                             "description": "Sort order: desc or asc.",
                         },
+                        "max_pages": {
+                            "type": "integer",
+                            "description": "Pages to fetch (1-5). Use 5 for core keywords to increase recall.",
+                            "minimum": 1,
+                            "maximum": 5,
+                        },
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -150,12 +156,14 @@ def execute_tool_call(name: str, arguments: Any, timeout_s: int = 20) -> Dict[st
     if name == TOOL_SEARCH_GH:
         sort = str(args.get("sort", "stars")).strip() or "stars"
         order = str(args.get("order", "desc")).strip() or "desc"
+        max_pages = max(1, min(int(args.get("max_pages", 1)), 10))
         rows = search_repositories(
             query=query,
-            limit=limit,
+            limit=max(limit, 100) if max_pages > 1 else limit,
             sort=sort,
             order=order,
             timeout_s=timeout_s,
+            max_pages=max_pages,
         )
         return {
             "tool_name": name,

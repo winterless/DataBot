@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _log(msg: str) -> None:
@@ -32,13 +32,39 @@ def _log(msg: str) -> None:
 try:
     from .function_tools import execute_tool_call, get_tool_schemas
     from .source_selector import select_candidates_two_layer
-    from .api_clients.huggingface_api import search_datasets_recent, list_datasets_by_author
-    from .api_clients.github_api import search_repositories_time_sweep
+    from .api_clients.huggingface_api import (
+        search_datasets_recent,
+        list_datasets_by_author,
+        search_datasets_by_tags,
+    )
+    from .api_clients.github_api import (
+        search_repositories_time_sweep,
+        search_repositories,
+        search_code_for_data_repos,
+    )
+    from .readme_extractor import (
+        extract_linked_repos,
+        fetch_github_readme,
+        fetch_hf_dataset_readme,
+    )
 except ImportError:  # pragma: no cover - direct script execution fallback
     from function_tools import execute_tool_call, get_tool_schemas
     from source_selector import select_candidates_two_layer
-    from api_clients.huggingface_api import search_datasets_recent, list_datasets_by_author
-    from api_clients.github_api import search_repositories_time_sweep
+    from api_clients.huggingface_api import (
+        search_datasets_recent,
+        list_datasets_by_author,
+        search_datasets_by_tags,
+    )
+    from api_clients.github_api import (
+        search_repositories_time_sweep,
+        search_repositories,
+        search_code_for_data_repos,
+    )
+    from readme_extractor import (
+        extract_linked_repos,
+        fetch_github_readme,
+        fetch_hf_dataset_readme,
+    )
 
 DEFAULT_ALIYUN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ALIYUN_MODEL = "qwen-plus"
@@ -138,6 +164,14 @@ def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["sweep_limits"] = {
             "hf_limit": int(ts.get("hf_limit", 100)),
             "gh_limit": int(ts.get("gh_limit", 150)),
+        }
+    ds = cfg.get("deep_scan")
+    if isinstance(ds, dict):
+        out["deep_scan"] = {
+            "enabled": bool(ds.get("enabled", True)),
+            "max_pages": int(ds.get("max_pages", 5)),
+            "readme_sample_size": int(ds.get("readme_sample_size", 30)),
+            "code_search_limit": int(ds.get("code_search_limit", 50)),
         }
     return out
 
@@ -322,6 +356,15 @@ def _build_hf_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
     for token in unique_tokens[:8]:
         fallback.append(token)
 
+    # 通用 fallback 关键词，当 prompt 分词不足时补充
+    generic_seeds = [
+        "agent", "agentic", "instruction", "reasoning", "code",
+        "function calling", "trajectory", "tool", "llm",
+    ]
+    for seed in generic_seeds:
+        if seed not in fallback:
+            fallback.append(seed)
+
     normalized_initial = initial_query.strip().lower()
     return [q for q in fallback if q and q.strip().lower() != normalized_initial]
 
@@ -333,6 +376,141 @@ def _build_gh_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
         out.append(f"{seed} language:python")
         out.append(f"{seed} llm")
     return out[:12]
+
+
+_CODEC_SEARCH_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "data", "dataset", "datasets",
+    "training", "please", "code", "repo", "repository",
+})
+
+
+def _extract_domain_keywords(hf_query: str, gh_query: str) -> List[str]:
+    """Extract domain keywords for code search (agent, function call, etc.).
+    Excludes generic terms like dataset, data, training that add no specificity.
+    """
+    base = f"{hf_query} {gh_query}".lower()
+    tokens = [t for t in re.split(r"[^a-z0-9_-]+", base) if 2 <= len(t) <= 30]
+    seen: set = set()
+    out: List[str] = []
+    for t in tokens:
+        if t not in seen and t not in _CODEC_SEARCH_STOPWORDS:
+            seen.add(t)
+            out.append(t)
+    return out[:5]
+
+
+def _stub_from_repo_id(source_type: str, repo_id: str) -> Dict[str, Any]:
+    """Create minimal candidate stub from repo_id (for README-extracted links)."""
+    name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
+    if source_type == "huggingface":
+        return {
+            "dataset_name": name,
+            "repo_id": repo_id,
+            "source_type": "huggingface",
+            "source_url": f"https://huggingface.co/datasets/{repo_id}",
+            "license": "unknown",
+            "downloads": None,
+            "likes": None,
+            "size": None,
+            "size_human": "unknown",
+            "size_mb": None,
+            "last_modified": "",
+            "description": "",
+        }
+    return {
+        "dataset_name": name,
+        "repo_id": repo_id,
+        "source_type": "github",
+        "source_url": f"https://github.com/{repo_id}",
+        "license": "unknown",
+        "stars": None,
+        "size": None,
+        "size_human": "unknown",
+        "size_mb": None,
+        "updated_at": "",
+        "description": "",
+    }
+
+
+def _run_deep_scan(
+    hf_rows: List[Dict[str, Any]],
+    gh_rows: List[Dict[str, Any]],
+    timeout_s: int,
+    hf_primary_query: str,
+    gh_primary_query: str,
+    deep_scan_cfg: Optional[Dict[str, Any]],
+) -> None:
+    """Deep scan: code search, HF tags, pagination, README link extraction."""
+    if not deep_scan_cfg or not deep_scan_cfg.get("enabled"):
+        return
+    cfg = deep_scan_cfg
+    max_pages = int(cfg.get("max_pages", 5))
+    readme_sample = int(cfg.get("readme_sample_size", 30))
+    code_search_limit = int(cfg.get("code_search_limit", 50))
+
+    try:
+        domain_kw = _extract_domain_keywords(hf_primary_query, gh_primary_query)
+        added = _merge_unique_candidates(
+            gh_rows,
+            search_code_for_data_repos(code_search_limit, timeout_s, domain_keywords=domain_kw),
+        )
+        if added:
+            _log(f"Deep scan: code search (domain={domain_kw or 'generic'}): +{added}")
+    except Exception as e:
+        _log(f"WARN: Code search failed: {e}")
+
+    try:
+        added = _merge_unique_candidates(hf_rows, search_datasets_by_tags(limit_per_tag=50, timeout_s=timeout_s))
+        if added:
+            _log(f"Deep scan: HF semantic tags: +{added}")
+    except Exception as e:
+        _log(f"WARN: HF tag search failed: {e}")
+
+    if gh_primary_query.strip() and max_pages > 1:
+        try:
+            extra = search_repositories(
+                gh_primary_query,
+                limit=500,
+                sort="stars",
+                order="desc",
+                timeout_s=timeout_s,
+                max_pages=max_pages,
+                full_field=True,
+            )
+            added = _merge_unique_candidates(gh_rows, extra)
+            if added:
+                _log(f"Deep scan: GH pagination (max_pages={max_pages}): +{added}")
+        except Exception as e:
+            _log(f"WARN: GH pagination failed: {e}")
+
+    all_content: List[Tuple[str, str, str]] = []
+    for item in gh_rows[:readme_sample]:
+        rid = str(item.get("repo_id", "")).strip()
+        if "/" in rid:
+            parts = rid.split("/", 1)
+            if len(parts) == 2:
+                content = fetch_github_readme(parts[0], parts[1], timeout_s)
+                if content:
+                    all_content.append(("github", rid, content))
+    for item in hf_rows[:readme_sample]:
+        rid = str(item.get("repo_id", "")).strip()
+        if "/" in rid:
+            content = fetch_hf_dataset_readme(rid, timeout_s)
+            if content:
+                all_content.append(("huggingface", rid, content))
+
+    linked: List[Tuple[str, str]] = []
+    for _st, _rid, content in all_content:
+        for src, repo_id in extract_linked_repos(content):
+            if src and repo_id:
+                linked.append((src, repo_id))
+
+    if linked:
+        stubs = [_stub_from_repo_id(src, rid) for src, rid in linked]
+        added_hf = _merge_unique_candidates(hf_rows, [s for s in stubs if s.get("source_type") == "huggingface"])
+        added_gh = _merge_unique_candidates(gh_rows, [s for s in stubs if s.get("source_type") == "github"])
+        if added_hf or added_gh:
+            _log(f"Deep scan: README links (HF +{added_hf}, GH +{added_gh})")
 
 
 def _run_time_sweep_and_seed_orgs(
@@ -397,6 +575,7 @@ def _collect_candidates_from_tools(
     raw_prompt: str,
     recall_pool_size: int,
     sweep_limits: Optional[Dict[str, int]] = None,
+    deep_scan_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     total_weight = max(int(source_policy.get("huggingface", 6)) + int(source_policy.get("github", 4)), 1)
     hf_need = max(1, int(round(recall_pool_size * int(source_policy.get("huggingface", 6)) / total_weight)))
@@ -434,6 +613,8 @@ def _collect_candidates_from_tools(
             parsed_args["limit"] = max(int(parsed_args.get("limit", 0) or 0), min(max(gh_need, 20), 100))
             parsed_args["sort"] = str(parsed_args.get("sort", "stars") or "stars")
             parsed_args["order"] = str(parsed_args.get("order", "desc") or "desc")
+            if deep_scan_cfg and deep_scan_cfg.get("enabled"):
+                parsed_args["max_pages"] = int(deep_scan_cfg.get("max_pages", 5))
         try:
             result = execute_tool_call(name, parsed_args, timeout_s=timeout_s)
         except Exception:
@@ -494,6 +675,13 @@ def _collect_candidates_from_tools(
             if added > 0:
                 gh_fallback_queries.append(q)
 
+    _run_deep_scan(
+        hf_rows, gh_rows, timeout_s,
+        hf_primary_query=hf_primary_query,
+        gh_primary_query=gh_primary_query,
+        deep_scan_cfg=deep_scan_cfg,
+    )
+
     _run_time_sweep_and_seed_orgs(
         hf_rows, gh_rows, timeout_s,
         dynamic_seed_orgs=dynamic_seed_orgs,
@@ -548,6 +736,7 @@ def run_datasearcher_branch_a(
     preferred_size: Optional[Dict[str, Any]] = None,
     llm_trace_output: Optional[str] = None,
     sweep_limits: Optional[Dict[str, int]] = None,
+    deep_scan_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     resolved_provider = provider.strip().lower()
     headers: Dict[str, str] = {}
@@ -644,6 +833,7 @@ def run_datasearcher_branch_a(
             raw_prompt=prompt,
             recall_pool_size=recall_pool_size,
             sweep_limits=sweep_limits,
+            deep_scan_cfg=deep_scan_cfg,
         )
         hf_rows = candidate_map["huggingface"]
         gh_rows = candidate_map["github"]
@@ -795,6 +985,7 @@ def main() -> int:
     preferred_size = layer_cfg.get("preferred_size") if isinstance(layer_cfg.get("preferred_size"), dict) else None
     llm_trace_output = str(cfg.get("llm_trace_output", DEFAULT_LLM_TRACE_OUTPUT_PATH)).strip() or DEFAULT_LLM_TRACE_OUTPUT_PATH
     sweep_limits = layer_cfg.get("sweep_limits") if isinstance(layer_cfg.get("sweep_limits"), dict) else None
+    deep_scan_cfg = layer_cfg.get("deep_scan") if isinstance(layer_cfg.get("deep_scan"), dict) else None
 
     _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}")
     if preferred_size:
@@ -819,6 +1010,7 @@ def main() -> int:
             preferred_size=preferred_size,
             llm_trace_output=llm_trace_output,
             sweep_limits=sweep_limits,
+            deep_scan_cfg=deep_scan_cfg,
         )
     except Exception as e:
         envelope = _response_envelope_failed("SYSTEM_ERROR", f"Unexpected failure: {e}", retryable=False)

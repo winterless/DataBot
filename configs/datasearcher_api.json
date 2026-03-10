@@ -3,6 +3,12 @@
     "hf_limit": 100,
     "gh_limit": 150
   },
+  "deep_scan": {
+    "enabled": true,
+    "max_pages": 5,
+    "readme_sample_size": 30,
+    "code_search_limit": 50
+  },
   "default_provider": "aliyun",
   "providers": {
     "local": {

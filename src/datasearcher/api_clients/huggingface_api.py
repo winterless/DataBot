@@ -209,6 +209,55 @@ def search_datasets_recent(
     return out
 
 
+HF_SEMANTIC_TAGS = ("conversational", "code-generation", "instruction-tuning")
+
+
+def search_datasets_by_tags(
+    tags: tuple = HF_SEMANTIC_TAGS,
+    limit_per_tag: int = 50,
+    timeout_s: int = 20,
+) -> List[Dict[str, Any]]:
+    """Search HF datasets by semantic tags (cold but relevant)."""
+    seen_ids: set = set()
+    out: List[Dict[str, Any]] = []
+    for tag in tags:
+        if not tag or not isinstance(tag, str):
+            continue
+        payload = _search_datasets_single(
+            tag.strip(),
+            min(limit_per_tag, 100),
+            timeout_s,
+            sort="downloads",
+            direction="-1",
+        )
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            repo_id = _safe_str(item.get("id"))
+            if not repo_id or repo_id in seen_ids:
+                continue
+            seen_ids.add(repo_id)
+            card_data = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
+            license_name = _safe_str(card_data.get("license")) or _safe_str(item.get("license"))
+            size_human = _extract_hf_size(card_data)
+            size_mb = _extract_hf_size_mb(item)
+            out.append({
+                "dataset_name": repo_id.split("/")[-1],
+                "repo_id": repo_id,
+                "source_type": "huggingface",
+                "source_url": f"https://huggingface.co/datasets/{repo_id}",
+                "license": license_name or "unknown",
+                "downloads": item.get("downloads"),
+                "likes": item.get("likes"),
+                "size": None,
+                "size_human": size_human or "unknown",
+                "size_mb": round(size_mb, 2) if size_mb is not None else None,
+                "last_modified": _safe_str(item.get("lastModified")),
+                "description": _safe_str(item.get("description"))[:500],
+            })
+    return out
+
+
 def list_datasets_by_author(
     author: str,
     limit: int = 100,
