@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
@@ -12,14 +13,23 @@ GITHUB_CODE_SEARCH_ENDPOINT = "https://api.github.com/search/code"
 IN_QUALIFIER = " in:name,description,readme"
 
 
+def _auth_headers() -> Dict[str, str]:
+    """Build request headers, including Authorization if GITHUB_TOKEN is set."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "DataBot-DataSearcher",
+    }
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _get_json(url: str, timeout_s: int = 20) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "DataBot-DataSearcher",
-        },
+        headers=_auth_headers(),
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:

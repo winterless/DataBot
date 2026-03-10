@@ -36,6 +36,95 @@ def _size_mb_from_size_human(size_human: Any) -> Optional[float]:
     return None
 
 
+# HF size_human row-count patterns -> midpoint rows.
+_SIZE_ROW_MAP = [
+    (r"n\s*<\s*1k", 500),
+    (r"1k\s*<\s*n\s*<\s*10k", 5_500),
+    (r"10k\s*<\s*n\s*<\s*100k", 55_000),
+    (r"100k\s*<\s*n\s*<\s*1m", 550_000),
+    (r"1m\s*<\s*n\s*<\s*10m", 5_500_000),
+    (r"10m\s*<\s*n\s*<\s*100m", 55_000_000),
+    (r"100m\s*<\s*n\s*<\s*1b", 550_000_000),
+    (r"1b\s*<\s*n\s*<\s*10b", 5_500_000_000),
+    (r"10b\s*<\s*n\s*<\s*100b", 55_000_000_000),
+    (r"100b\s*<\s*n\s*<\s*1t", 550_000_000_000),
+    (r"n\s*>\s*1t", 1_500_000_000_000),
+    (r"n\s*>\s*1m", 5_500_000),
+    (r"(\d+)\s*k\b", None),  # 435K -> 435000
+    (r"(\d+)\s*kb", None),   # 1485 KB -> treat as disk, not rows
+]
+BYTES_PER_ROW_EST = 512  # 0.5KB per row for MB conversion when rows known
+
+
+def _parse_single_segment(sh: str) -> Tuple[Optional[int], Optional[float]]:
+    """Parse one size_human segment -> (rows, mb). Returns (None, None) if unparseable."""
+    rows: Optional[int] = None
+    mb: Optional[float] = None
+    if not sh:
+        return (None, None)
+    for pat, val in _SIZE_ROW_MAP:
+        if val is not None and re.search(pat, sh, re.I):
+            rows = val
+            break
+    if rows is None:
+        m = re.search(r"(\d+)\s*k\b", sh)
+        if m and "kb" not in sh:
+            rows = int(m.group(1)) * 1000
+    if rows is None and "kb" in sh:
+        m = re.search(r"(\d+)\s*kb", sh)
+        if m:
+            mb = int(m.group(1)) / 1024.0
+    if mb is None and rows is not None:
+        mb = rows * BYTES_PER_ROW_EST / (1024 * 1024)
+    return (rows, round(mb, 2) if mb is not None else None)
+
+
+def _parse_size_to_comparable(
+    size_human: Any,
+    size_mb: Any,
+    size_kb: Any,
+) -> Tuple[Optional[int], Optional[float]]:
+    """Parse size to (size_rows_equivalent, size_comparable_mb).
+    size_rows_equivalent: int for row-based HF formats; None when unknown.
+    size_comparable_mb: float, unified MB for comparison. None when unknown (no fake default).
+    """
+    mb: Optional[float] = None
+    if size_mb is not None:
+        try:
+            mb = float(size_mb)
+        except (TypeError, ValueError):
+            pass
+    if mb is None and size_kb is not None:
+        mb = _size_mb_from_kb(size_kb)
+
+    sh = str(size_human or "").strip().lower() if size_human else ""
+    if not sh or "unknown" in sh:
+        return (None, round(mb, 2) if mb is not None else None)
+
+    segments = [s.strip() for s in re.split(r"[,;]", sh) if s.strip()]
+    if not segments:
+        return (None, round(mb, 2) if mb is not None else None)
+
+    # Parse each segment; for comma-separated (e.g. "n<1K,1K<n<10K,10K<n<100K") take largest
+    best_rows: Optional[int] = None
+    best_mb: Optional[float] = None
+    for seg in segments:
+        r, m = _parse_single_segment(seg)
+        if r is not None and (best_rows is None or r > best_rows):
+            best_rows = r
+            best_mb = m
+        elif m is not None and best_rows is None and best_mb is None:
+            best_mb = m  # disk size (KB) from one segment
+
+    rows = best_rows
+    if mb is None and best_mb is not None:
+        mb = best_mb
+    elif mb is None and rows is not None:
+        mb = rows * BYTES_PER_ROW_EST / (1024 * 1024)
+
+    return (rows, round(mb, 2) if mb is not None else None)
+
+
 def _size_human_matches_exclude(size_human: Any, exclude: Tuple[str, ...]) -> bool:
     """Return True if size_human matches any exclude pattern (union check)."""
     if not size_human or not isinstance(size_human, str):
@@ -166,6 +255,13 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
     else:
         cmd = ""
 
+    brief_intro = str(item.get("description", "")).strip()[:300] or None
+    size_rows, size_comparable_mb = _parse_size_to_comparable(
+        item.get("size_human"),
+        item.get("size_mb"),
+        item.get("size"),
+    )
+
     return {
         "dataset_name": str(item.get("dataset_name", "")).strip() or repo_id.split("/")[-1],
         "source_type": source_type,
@@ -175,6 +271,7 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
         "download_command": cmd,
         "license": str(item.get("license", "")).strip() or "unknown",
         "reason": reason,
+        "brief_intro": brief_intro,
         "verified_meta": {
             "downloads": item.get("downloads"),
             "likes": item.get("likes"),
@@ -182,6 +279,8 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
             "size": item.get("size"),
             "size_human": item.get("size_human"),
             "size_mb": item.get("size_mb"),
+            "size_rows_equivalent": size_rows,
+            "size_comparable_mb": size_comparable_mb,
             "updated_at": item.get("updated_at"),
             "last_modified": item.get("last_modified"),
         },

@@ -4,6 +4,9 @@
 # search 融合了 extract：API 召回 + preferred_size/exclude_size_human 规则筛选 -> download_list
 set -euo pipefail
 
+# Load .env if present (GITHUB_TOKEN, DASHSCOPE_API_KEY, etc.)
+[[ -f .env ]] && set -a && . .env && set +a
+
 API="${API:-aliyun}"   # export API=local to use local provider
 MODE="${MODE:-search}"    # search | download | all
 
