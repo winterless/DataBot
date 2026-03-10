@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# DataSearcher 烟雾测试：按 MODE 执行 search（样本生成）、download（后台下载）或 all。
-# 用法：MODE=search|download|all API=aliyun|local ./scripts/smoke_datasearcher.sh
-# 输出与日志：out/datasearcher/（sample、download_report、nohup 等）
+# DataSearcher 烟雾测试：按 MODE 执行 search（召回+规则筛选）、download（下载）或 all。
+# 用法：MODE=search|download|all API=aliyun|local ./smoke_datasearcher.sh
+# search 融合了 extract：API 召回 + preferred_size/exclude_size_human 规则筛选 -> download_list
 set -euo pipefail
 
 API="${API:-aliyun}"   # export API=local to use local provider

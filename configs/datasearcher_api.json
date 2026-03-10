@@ -1,4 +1,8 @@
 {
+  "time_sweep": {
+    "hf_limit": 100,
+    "gh_limit": 150
+  },
   "default_provider": "aliyun",
   "providers": {
     "local": {
@@ -22,7 +26,8 @@
     "download_size": 10,
     "preferred_size": {
       "min_mb": 1000,
-      "max_mb": 50000
+      "max_mb": 50000,
+      "exclude_size_human": ["n>1t", "unknown", "100b<n", "1b<n", "100m<n"]
     }
   },
   "recall_pool_output": "out/datasearcher/recall_pool.jsonl",

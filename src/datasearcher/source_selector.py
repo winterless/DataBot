@@ -6,29 +6,95 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# size_human patterns that indicate "too large" or "unknown" - exclude when matched
+DEFAULT_EXCLUDE_SIZE_HUMAN = (
+    "n>1t",
+    "unknown",
+    "100b<n",
+    "1b<n",
+    "100m<n",
+)
+
+
+def _size_mb_from_kb(size_kb: Any) -> Optional[float]:
+    """Convert size_kb to size_mb, or None if invalid."""
+    if size_kb is None:
+        return None
+    try:
+        return int(size_kb) / 1024.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _size_mb_from_size_human(size_human: Any) -> Optional[float]:
+    """Parse 'X KB' from size_human, return size_mb or None."""
+    if not size_human or not isinstance(size_human, str):
+        return None
+    m = re.search(r"(\d+)\s*kb", str(size_human).strip().lower())
+    if m:
+        return int(m.group(1)) / 1024.0
+    return None
+
+
+def _size_human_matches_exclude(size_human: Any, exclude: Tuple[str, ...]) -> bool:
+    """Return True if size_human matches any exclude pattern (union check)."""
+    if not size_human or not isinstance(size_human, str):
+        return False
+    lower = str(size_human).strip().lower()
+    if not lower:
+        return False
+    for pat in exclude:
+        if pat and pat in lower:
+            return True
+    for part in re.split(r"[,;]", lower):
+        part = part.strip()
+        for pat in exclude:
+            if pat and pat in part:
+                return True
+    return False
+
+
 def _in_preferred_size(
     item: Dict[str, Any],
     preferred: Optional[Dict[str, Any]],
 ) -> bool:
-    """Return True if item passes preferred_size filter (or no filter)."""
+    """Return True if item passes preferred_size filter (or no filter).
+    Uses union of size and size_human: exclude when EITHER indicates out-of-range.
+    """
     if not preferred:
         return True
-    source_type = str(item.get("source_type", "")).lower()
-    if source_type == "huggingface":
+    min_mb = float(preferred.get("min_mb", 0))
+    max_mb = float(preferred.get("max_mb", 0)) or 10**6
+    if min_mb <= 0 and max_mb >= 10**6:
         return True
-    if source_type == "github":
-        min_mb = float(preferred.get("min_mb", 0))
-        max_mb = float(preferred.get("max_mb", 0)) or 10**6
-        if min_mb <= 0 and max_mb >= 10**6:
-            return True
-        size_kb = item.get("size")
-        if size_kb is None:
-            return True
-        try:
-            size_mb = int(size_kb) / 1024.0
-        except (TypeError, ValueError):
-            return True
-        return min_mb <= size_mb <= max_mb
+
+    exclude_patterns = tuple(
+        str(p).strip().lower()
+        for p in preferred.get("exclude_size_human") or DEFAULT_EXCLUDE_SIZE_HUMAN
+        if str(p).strip()
+    )
+
+    source_type = str(item.get("source_type", "")).lower()
+    size_mb = item.get("size_mb")
+    size_kb = item.get("size")
+    size_human = item.get("size_human")
+
+    if size_mb is None and size_kb is not None:
+        size_mb = _size_mb_from_kb(size_kb)
+    if size_mb is None and size_human:
+        size_mb = _size_mb_from_size_human(size_human)
+
+    if size_mb is not None:
+        if size_mb < min_mb or size_mb > max_mb:
+            return False
+
+    if _size_human_matches_exclude(size_human, exclude_patterns):
+        return False
+
+    if source_type == "huggingface" and size_mb is None:
+        sh = str(size_human or "").strip().lower()
+        if not sh or sh == "unknown":
+            return False
     return True
 
 
@@ -115,6 +181,7 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
             "stars": item.get("stars"),
             "size": item.get("size"),
             "size_human": item.get("size_human"),
+            "size_mb": item.get("size_mb"),
             "updated_at": item.get("updated_at"),
             "last_modified": item.get("last_modified"),
         },
@@ -151,13 +218,6 @@ def select_candidates_two_layer(
 
     hf_pool = _dedupe_by_repo(hf_candidates)
     gh_pool = _dedupe_by_repo(gh_candidates)
-    if preferred_size:
-        hf_before, gh_before = len(hf_pool), len(gh_pool)
-        hf_pool = [x for x in hf_pool if _in_preferred_size(x, preferred_size)]
-        gh_pool = [x for x in gh_pool if _in_preferred_size(x, preferred_size)]
-        dropped_hf, dropped_gh = hf_before - len(hf_pool), gh_before - len(gh_pool)
-        if dropped_hf or dropped_gh:
-            notes.append(f"preferred_size过滤: HF剔除{dropped_hf}, GH剔除{dropped_gh}")
 
     hf_ranked = sorted(hf_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
     gh_ranked = sorted(gh_pool, key=lambda x: _score_candidate(x, intent_text), reverse=True)
@@ -165,12 +225,23 @@ def select_candidates_two_layer(
     hf_recall_need, gh_recall_need = _ratio_counts(recall_pool_size, source_policy)
     hf_recall = hf_ranked[:hf_recall_need]
     gh_recall = gh_ranked[:gh_recall_need]
+    hf_recall = sorted(hf_recall, key=lambda x: (float(x.get("downloads") or 0), float(x.get("likes") or 0)), reverse=True)
+    gh_recall = sorted(gh_recall, key=lambda x: float(x.get("stars") or 0), reverse=True)
     recall_rows = hf_recall + gh_recall
 
     if len(hf_recall) < hf_recall_need:
         notes.append(f"recall层huggingface不足: 期望{hf_recall_need}, 实得{len(hf_recall)}")
     if len(gh_recall) < gh_recall_need:
         notes.append(f"recall层github不足: 期望{gh_recall_need}, 实得{len(gh_recall)}")
+
+    if preferred_size:
+        hf_recall_filtered = [x for x in hf_recall if _in_preferred_size(x, preferred_size)]
+        gh_recall_filtered = [x for x in gh_recall if _in_preferred_size(x, preferred_size)]
+        dropped_hf = len(hf_recall) - len(hf_recall_filtered)
+        dropped_gh = len(gh_recall) - len(gh_recall_filtered)
+        if dropped_hf or dropped_gh:
+            notes.append(f"download层preferred_size过滤: HF剔除{dropped_hf}, GH剔除{dropped_gh}")
+        hf_recall, gh_recall = hf_recall_filtered, gh_recall_filtered
 
     hf_download_need, gh_download_need = _ratio_counts(download_size, source_policy)
     hf_download = hf_recall[:hf_download_need]
@@ -181,14 +252,13 @@ def select_candidates_two_layer(
         notes.append(f"download层huggingface不足: 期望{hf_download_need}, 实得{len(hf_download)}")
     if len(gh_download) < gh_download_need:
         notes.append(f"download层github不足: 期望{gh_download_need}, 实得{len(gh_download)}")
-
     return {
         "recall_pool": [
             _normalize_selected_item(item, "In recall pool.")
             for item in recall_rows
         ],
         "download_list": [
-            _normalize_selected_item(item, "Selected for download by semantic relevance and source policy.")
+            _normalize_selected_item(item, "Selected by source policy and size filter (extract).")
             for item in download_rows
         ],
         "notes": notes,

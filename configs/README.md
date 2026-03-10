@@ -11,5 +11,6 @@
 `datasearcher_api.json` 的 `selection` 字段用于两层筛选参数：
 - `recall_pool_size`：第一层召回池数量（如 120）
 - `download_size`：第二层下载清单数量（如 10）
-- `preferred_size`：数据大小范围过滤，避免过大或过小
+- `preferred_size`：仅在 download 层生效，召回阶段不过滤
   - `min_mb` / `max_mb`：GitHub 仓库体积范围（MB，如 1～500）
+  - `exclude_size_human`：HF size_human 排除模式（如 n>1t、unknown）

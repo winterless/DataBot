@@ -32,9 +32,13 @@ def _log(msg: str) -> None:
 try:
     from .function_tools import execute_tool_call, get_tool_schemas
     from .source_selector import select_candidates_two_layer
+    from .api_clients.huggingface_api import search_datasets_recent, list_datasets_by_author
+    from .api_clients.github_api import search_repositories_time_sweep
 except ImportError:  # pragma: no cover - direct script execution fallback
     from function_tools import execute_tool_call, get_tool_schemas
     from source_selector import select_candidates_two_layer
+    from api_clients.huggingface_api import search_datasets_recent, list_datasets_by_author
+    from api_clients.github_api import search_repositories_time_sweep
 
 DEFAULT_ALIYUN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ALIYUN_MODEL = "qwen-plus"
@@ -129,6 +133,12 @@ def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     pref = layer_cfg.get("preferred_size")
     if isinstance(pref, dict):
         out["preferred_size"] = pref
+    ts = cfg.get("time_sweep")
+    if isinstance(ts, dict):
+        out["sweep_limits"] = {
+            "hf_limit": int(ts.get("hf_limit", 100)),
+            "gh_limit": int(ts.get("gh_limit", 150)),
+        }
     return out
 
 
@@ -312,11 +322,6 @@ def _build_hf_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
     for token in unique_tokens[:8]:
         fallback.append(token)
 
-    # Static high-recall seeds for instruction/chat/coding datasets.
-    for seed in ["instruction", "chat", "alpaca", "reasoning", "code", "llm"]:
-        if seed not in fallback:
-            fallback.append(seed)
-
     normalized_initial = initial_query.strip().lower()
     return [q for q in fallback if q and q.strip().lower() != normalized_initial]
 
@@ -330,12 +335,68 @@ def _build_gh_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
     return out[:12]
 
 
+def _run_time_sweep_and_seed_orgs(
+    hf_rows: List[Dict[str, Any]],
+    gh_rows: List[Dict[str, Any]],
+    timeout_s: int,
+    dynamic_seed_orgs: List[str],
+    suggested_created_after: Optional[str],
+    hf_primary_query: str,
+    gh_primary_query: str,
+    raw_prompt: str,
+    sweep_limits: Optional[Dict[str, int]] = None,
+) -> None:
+    """Merge time-sweep and seed-org results (LLM-driven params only) into hf_rows/gh_rows."""
+    limits = sweep_limits or {}
+    hf_limit = int(limits.get("hf_limit", 100))
+    gh_limit = int(limits.get("gh_limit", 150))
+
+    if suggested_created_after:
+        base_q = gh_primary_query.strip() or " ".join(re.split(r"[^a-zA-Z0-9_-]+", raw_prompt)[:3])
+        if not base_q:
+            base_q = "dataset"
+        try:
+            added = _merge_unique_candidates(
+                gh_rows,
+                search_repositories_time_sweep(base_q, suggested_created_after, gh_limit, timeout_s),
+            )
+            if added:
+                _log(f"Time-sweep GH (sort=updated, created:>{suggested_created_after}): +{added}")
+        except Exception as e:
+            _log(f"WARN: GH time-sweep failed: {e}")
+
+    hf_sweep_queries = [q for q in [hf_primary_query.strip()] if q]
+    if not hf_sweep_queries and raw_prompt:
+        tokens = [t for t in re.split(r"[^a-zA-Z0-9_-]+", raw_prompt.lower()) if len(t) >= 3][:3]
+        hf_sweep_queries = tokens or ["dataset"]
+    if suggested_created_after and hf_sweep_queries:
+        try:
+            for q in hf_sweep_queries[:2]:
+                added = _merge_unique_candidates(hf_rows, search_datasets_recent(q, hf_limit, timeout_s))
+                if added:
+                    _log(f"Time-sweep HF (sort=createdAt, q={q}): +{added}")
+        except Exception as e:
+            _log(f"WARN: HF time-sweep failed: {e}")
+
+    for org in dynamic_seed_orgs:
+        org = str(org).strip()
+        if not org:
+            continue
+        try:
+            added = _merge_unique_candidates(hf_rows, list_datasets_by_author(org, 100, timeout_s))
+            if added:
+                _log(f"Seed org {org}: +{added}")
+        except Exception as e:
+            _log(f"WARN: Seed org {org} failed: {e}")
+
+
 def _collect_candidates_from_tools(
     tool_calls: List[Dict[str, Any]],
     timeout_s: int,
     source_policy: Dict[str, int],
     raw_prompt: str,
     recall_pool_size: int,
+    sweep_limits: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     total_weight = max(int(source_policy.get("huggingface", 6)) + int(source_policy.get("github", 4)), 1)
     hf_need = max(1, int(round(recall_pool_size * int(source_policy.get("huggingface", 6)) / total_weight)))
@@ -349,11 +410,24 @@ def _collect_candidates_from_tools(
     hf_fallback_queries: List[str] = []
     gh_fallback_queries: List[str] = []
 
+    dynamic_seed_orgs: List[str] = []
+    suggested_created_after: Optional[str] = None
+
     for call in tool_calls:
         fn = call.get("function") if isinstance(call.get("function"), dict) else {}
         name = str(fn.get("name", "")).strip()
         args = fn.get("arguments", "{}")
         parsed_args = _parse_tool_arguments(args)
+
+        if name == "set_discovery_parameters":
+            try:
+                result = execute_tool_call(name, parsed_args, timeout_s=timeout_s)
+                dynamic_seed_orgs = result.get("dynamic_seed_orgs") or []
+                suggested_created_after = result.get("suggested_created_after")
+            except Exception:
+                pass
+            continue
+
         if name == "search_huggingface_datasets":
             parsed_args["limit"] = max(int(parsed_args.get("limit", 0) or 0), min(max(hf_need, 20), 100))
         elif name == "search_github_repositories":
@@ -420,6 +494,16 @@ def _collect_candidates_from_tools(
             if added > 0:
                 gh_fallback_queries.append(q)
 
+    _run_time_sweep_and_seed_orgs(
+        hf_rows, gh_rows, timeout_s,
+        dynamic_seed_orgs=dynamic_seed_orgs,
+        suggested_created_after=suggested_created_after,
+        hf_primary_query=hf_primary_query,
+        gh_primary_query=gh_primary_query,
+        raw_prompt=raw_prompt,
+        sweep_limits=sweep_limits,
+    )
+
     return {
         "huggingface": hf_rows,
         "github": gh_rows,
@@ -427,6 +511,8 @@ def _collect_candidates_from_tools(
         "hf_fallback_queries": hf_fallback_queries,
         "gh_primary_query": gh_primary_query,
         "gh_fallback_queries": gh_fallback_queries,
+        "dynamic_seed_orgs": dynamic_seed_orgs,
+        "suggested_created_after": suggested_created_after,
     }
 
 
@@ -461,6 +547,7 @@ def run_datasearcher_branch_a(
     recall_pool_output: str,
     preferred_size: Optional[Dict[str, Any]] = None,
     llm_trace_output: Optional[str] = None,
+    sweep_limits: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     resolved_provider = provider.strip().lower()
     headers: Dict[str, str] = {}
@@ -556,6 +643,7 @@ def run_datasearcher_branch_a(
             source_policy=source_policy,
             raw_prompt=prompt,
             recall_pool_size=recall_pool_size,
+            sweep_limits=sweep_limits,
         )
         hf_rows = candidate_map["huggingface"]
         gh_rows = candidate_map["github"]
@@ -605,7 +693,6 @@ def run_datasearcher_branch_a(
             "base_url": resolved_base_url,
             "model_id": model_id,
             "source_policy": source_policy,
-            "datasets": selected,
             "download_list": selected,
             "recall_pool": recall_pool,
             "selection": {
@@ -628,6 +715,8 @@ def run_datasearcher_branch_a(
                 "hf_fallback_queries": hf_fallback_queries,
                 "gh_primary_query": gh_primary_query,
                 "gh_fallback_queries": gh_fallback_queries,
+                "dynamic_seed_orgs": candidate_map.get("dynamic_seed_orgs", []),
+                "suggested_created_after": candidate_map.get("suggested_created_after"),
                 "llm_usage": {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
@@ -705,6 +794,7 @@ def main() -> int:
     recall_pool_output = args.recall_pool_output or str(cfg.get("recall_pool_output", DEFAULT_RECALL_POOL_OUTPUT_PATH))
     preferred_size = layer_cfg.get("preferred_size") if isinstance(layer_cfg.get("preferred_size"), dict) else None
     llm_trace_output = str(cfg.get("llm_trace_output", DEFAULT_LLM_TRACE_OUTPUT_PATH)).strip() or DEFAULT_LLM_TRACE_OUTPUT_PATH
+    sweep_limits = layer_cfg.get("sweep_limits") if isinstance(layer_cfg.get("sweep_limits"), dict) else None
 
     _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}")
     if preferred_size:
@@ -728,6 +818,7 @@ def main() -> int:
             recall_pool_output=recall_pool_output,
             preferred_size=preferred_size,
             llm_trace_output=llm_trace_output,
+            sweep_limits=sweep_limits,
         )
     except Exception as e:
         envelope = _response_envelope_failed("SYSTEM_ERROR", f"Unexpected failure: {e}", retryable=False)

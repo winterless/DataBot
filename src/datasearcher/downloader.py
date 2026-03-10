@@ -37,9 +37,6 @@ def _extract_from_json_obj(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("download_list"), list):
         return [x for x in obj["data"]["download_list"] if isinstance(x, dict)]
 
-    if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("datasets"), list):
-        return [x for x in obj["data"]["datasets"] if isinstance(x, dict)]
-
     if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("valid_datasets"), list):
         return [x for x in obj["data"]["valid_datasets"] if isinstance(x, dict)]
 
