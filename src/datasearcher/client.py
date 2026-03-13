@@ -155,6 +155,7 @@ def _load_layer_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "recall_pool_size": max(1, int(layer_cfg.get("recall_pool_size", 120))),
         "download_size": max(1, int(layer_cfg.get("download_size", 10))),
+        "slice_download_count": max(0, int(layer_cfg.get("slice_download_count", 0))),
     }
     pref = layer_cfg.get("preferred_size")
     if isinstance(pref, dict):
@@ -758,6 +759,7 @@ def run_datasearcher_branch_a(
     download_size: int,
     recall_pool_output: str,
     preferred_size: Optional[Dict[str, Any]] = None,
+    slice_download_count: int = 0,
     llm_trace_output: Optional[str] = None,
     sweep_limits: Optional[Dict[str, int]] = None,
     deep_scan_cfg: Optional[Dict[str, Any]] = None,
@@ -874,11 +876,13 @@ def run_datasearcher_branch_a(
             recall_pool_size=recall_pool_size,
             download_size=download_size,
             preferred_size=preferred_size,
+            slice_download_count=slice_download_count,
         )
         recall_pool = layer_result["recall_pool"]
         selected = layer_result["download_list"]
+        slice_download_list = layer_result.get("slice_download_list", [])
         notes = layer_result["notes"]
-        _log(f"Selection done: recall_pool={len(recall_pool)}, download_list={len(selected)}")
+        _log(f"Selection done: recall_pool={len(recall_pool)}, download_list={len(selected)}, slice_download_list={len(slice_download_list)}")
     except Exception as e:
         return _response_envelope_failed("SYSTEM_ERROR", f"Tool execution stage failed: {e}", retryable=False)
 
@@ -909,9 +913,11 @@ def run_datasearcher_branch_a(
             "source_policy": source_policy,
             "download_list": selected,
             "recall_pool": recall_pool,
+            "slice_download_list": slice_download_list,
             "selection": {
                 "recall_pool_size": recall_pool_size,
                 "download_size": download_size,
+                "slice_download_count": slice_download_count,
                 "recall_pool_output": recall_pool_output,
                 "preferred_size": preferred_size,
             },
@@ -1005,13 +1011,14 @@ def main() -> int:
     retries = args.retries if args.retries >= 0 else int(os.getenv("RETRIES", str(req_cfg.get("retries", 2))))
     recall_pool_size = int(os.getenv("RECALL_POOL_SIZE", str(layer_cfg["recall_pool_size"])))
     download_size = int(os.getenv("DOWNLOAD_SIZE", str(layer_cfg["download_size"])))
+    slice_download_count = int(os.getenv("SLICE_DOWNLOAD_COUNT", str(layer_cfg.get("slice_download_count", 0))))
     recall_pool_output = args.recall_pool_output or str(cfg.get("recall_pool_output", DEFAULT_RECALL_POOL_OUTPUT_PATH))
     preferred_size = layer_cfg.get("preferred_size") if isinstance(layer_cfg.get("preferred_size"), dict) else None
     llm_trace_output = str(cfg.get("llm_trace_output", DEFAULT_LLM_TRACE_OUTPUT_PATH)).strip() or DEFAULT_LLM_TRACE_OUTPUT_PATH
     sweep_limits = layer_cfg.get("sweep_limits") if isinstance(layer_cfg.get("sweep_limits"), dict) else None
     deep_scan_cfg = layer_cfg.get("deep_scan") if isinstance(layer_cfg.get("deep_scan"), dict) else None
 
-    _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}")
+    _log(f"Starting: provider={provider}, recall_pool_size={recall_pool_size}, download_size={download_size}, slice_download_count={slice_download_count}")
     if preferred_size:
         _log(f"preferred_size: min_mb={preferred_size.get('min_mb')}, max_mb={preferred_size.get('max_mb')}")
     _log(f"Prompt: {prompt[:80]}..." if len(prompt) > 80 else f"Prompt: {prompt}")
@@ -1032,6 +1039,7 @@ def main() -> int:
             download_size=download_size,
             recall_pool_output=recall_pool_output,
             preferred_size=preferred_size,
+            slice_download_count=slice_download_count,
             llm_trace_output=llm_trace_output,
             sweep_limits=sweep_limits,
             deep_scan_cfg=deep_scan_cfg,

@@ -1,4 +1,5 @@
 fastapi
+huggingface_hub
 jsonschema
 pydantic
 torch

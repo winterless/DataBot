@@ -30,6 +30,7 @@
   "selection": {
     "recall_pool_size": 12000,
     "download_size": 10,
+    "slice_download_count": 1300,
     "preferred_size": {
       "min_mb": 1000,
       "max_mb": 50000,

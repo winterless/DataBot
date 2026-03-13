@@ -310,11 +310,13 @@ def select_candidates_two_layer(
     recall_pool_size: int,
     download_size: int,
     preferred_size: Optional[Dict[str, Any]] = None,
+    slice_download_count: int = 0,
 ) -> Dict[str, Any]:
     notes: List[str] = []
 
     recall_pool_size = max(1, int(recall_pool_size))
     download_size = max(1, int(download_size))
+    slice_download_count = max(0, int(slice_download_count))
 
     hf_pool = _dedupe_by_repo(hf_candidates)
     gh_pool = _dedupe_by_repo(gh_candidates)
@@ -352,6 +354,10 @@ def select_candidates_two_layer(
         notes.append(f"download层huggingface不足: 期望{hf_download_need}, 实得{len(hf_download)}")
     if len(gh_download) < gh_download_need:
         notes.append(f"download层github不足: 期望{gh_download_need}, 实得{len(gh_download)}")
+
+    # Slice download: top N from recall by rank (recall_rows already sorted by downloads/likes or stars)
+    slice_rows = recall_rows[:slice_download_count] if slice_download_count > 0 else []
+
     return {
         "recall_pool": [
             _normalize_selected_item(item, "In recall pool.")
@@ -360,6 +366,10 @@ def select_candidates_two_layer(
         "download_list": [
             _normalize_selected_item(item, "Selected by source policy and size filter (extract).")
             for item in download_rows
+        ],
+        "slice_download_list": [
+            _normalize_selected_item(item, "Slice download (whitelist-only, rank from recall).")
+            for item in slice_rows
         ],
         "notes": notes,
     }

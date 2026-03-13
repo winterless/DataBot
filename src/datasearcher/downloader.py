@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-DataSearcher Downloader — Download 步骤（按样本清单下载并校验）。
+DataSearcher Sample Fetcher — 通过 Datasets Server REST API 获取数据探查 Sample。
 
 读取 DataSearcher 产出的 sample 文件（JSON 或 JSONL），从中解析出 datasets 列表；
-按 source_type（huggingface / github）调用 huggingface-cli 或 git clone 下载到本地目录。
-支持重试、下载后校验（hf cache verify / git fsck），并将每条结果追加写入 download_report（JSONL）。
+对每个 HuggingFace 数据集，通过纯 HTTP 请求获取前 5–10 行 JSON 样本，保存为小文件。
+严禁使用 snapshot_download、hf_hub_download、huggingface-cli 或 git clone 下载物理文件。
 
-与 pipeline_architecture.md 对应：§3.1 DataSearcher 的「本地样本 URI」产出，为 §5.1 数据准备契约提供 raw_dir/sample_file。
+流程：
+1. GET /splits?dataset={repo_id} -> 解析 config/split
+2. GET /rows?dataset=...&config=...&split=...&offset=0&length=5 -> 提取 rows
+3. 保存到 samples/{repo_name}_sample.json
+4. 若 splits 返回 404（Viewer_Disabled），直接跳过，不兜底下载
 """
+from __future__ import annotations
+
 import argparse
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+try:
+    from .datasets_server_api import fetch_sample_via_api
+except ImportError:
+    from datasets_server_api import fetch_sample_via_api
 
 
 def _now_ts() -> str:
@@ -22,23 +32,32 @@ def _now_ts() -> str:
 
 
 def _log(msg: str) -> None:
-    """Print execution status to stderr (does not pollute report JSONL)."""
-    print(f"[{_now_ts()}] [Downloader] {msg}", file=sys.stderr)
+    print(f"[{_now_ts()}] [SampleFetcher] {msg}", file=sys.stderr)
 
 
 def _sanitize(name: str) -> str:
     return name.replace("/", "__")
 
 
-def _extract_from_json_obj(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_from_json_obj(obj: Dict[str, Any], use_slice: bool = False) -> List[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return []
 
-    if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("download_list"), list):
-        return [x for x in obj["data"]["download_list"] if isinstance(x, dict)]
-
-    if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("valid_datasets"), list):
-        return [x for x in obj["data"]["valid_datasets"] if isinstance(x, dict)]
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else None
+    if data:
+        if use_slice and isinstance(data.get("slice_download_list"), list):
+            slice_items = [x for x in data["slice_download_list"] if isinstance(x, dict)]
+            if slice_items:
+                return slice_items
+            if isinstance(data.get("download_list"), list):
+                dl = [x for x in data["download_list"] if isinstance(x, dict)]
+                if dl:
+                    _log("slice_download_list empty, fallback to download_list")
+                    return dl
+        if isinstance(data.get("download_list"), list):
+            return [x for x in data["download_list"] if isinstance(x, dict)]
+        if isinstance(data.get("valid_datasets"), list):
+            return [x for x in data["valid_datasets"] if isinstance(x, dict)]
 
     if isinstance(obj.get("datasets"), list):
         return [x for x in obj["datasets"] if isinstance(x, dict)]
@@ -49,7 +68,7 @@ def _extract_from_json_obj(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def load_samples(sample_path: Path) -> List[Dict[str, Any]]:
+def load_samples(sample_path: Path, use_slice: bool = False) -> List[Dict[str, Any]]:
     if not sample_path.exists():
         raise FileNotFoundError(f"Sample file not found: {sample_path}")
 
@@ -64,10 +83,10 @@ def load_samples(sample_path: Path) -> List[Dict[str, Any]]:
                     obj = json.loads(line)
                 except Exception as e:
                     raise ValueError(f"Invalid JSONL at line {i}: {e}") from e
-                datasets.extend(_extract_from_json_obj(obj))
+                datasets.extend(_extract_from_json_obj(obj, use_slice=use_slice))
     else:
         obj = json.loads(sample_path.read_text(encoding="utf-8"))
-        datasets.extend(_extract_from_json_obj(obj))
+        datasets.extend(_extract_from_json_obj(obj, use_slice=use_slice))
 
     dedup: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for d in datasets:
@@ -79,124 +98,30 @@ def load_samples(sample_path: Path) -> List[Dict[str, Any]]:
     return list(dedup.values())
 
 
-def build_download_cmd(item: Dict[str, Any], target_root: Path) -> Tuple[List[str], Path]:
-    source_type = str(item.get("source_type", "")).strip().lower()
-    repo_id = str(item.get("repo_id", "")).strip()
-    if source_type == "huggingface":
-        local_dir = target_root / f"hf__{_sanitize(repo_id)}"
-        cmd = [
-            "huggingface-cli",
-            "download",
-            "--repo-type",
-            "dataset",
-            repo_id,
-            "--local-dir",
-            str(local_dir),
-        ]
-        return cmd, local_dir
-    if source_type == "github":
-        local_dir = target_root / f"gh__{_sanitize(repo_id)}"
-        cmd = ["git", "clone", "--depth", "1", f"https://github.com/{repo_id}.git", str(local_dir)]
-        return cmd, local_dir
-    raise ValueError(f"Unsupported source_type: {source_type}")
-
-
-def build_verify_cmds(item: Dict[str, Any], local_dir: Path) -> List[List[str]]:
-    source_type = str(item.get("source_type", "")).strip().lower()
-    repo_id = str(item.get("repo_id", "")).strip()
-    if source_type == "huggingface":
-        return [
-            [
-                "hf",
-                "cache",
-                "verify",
-                repo_id,
-                "--repo-type",
-                "dataset",
-                "--local-dir",
-                str(local_dir),
-                "--fail-on-missing-files",
-            ]
-        ]
-    if source_type == "github":
-        return [
-            ["git", "-C", str(local_dir), "rev-parse", "HEAD"],
-            ["git", "-C", str(local_dir), "fsck", "--full"],
-        ]
-    raise ValueError(f"Unsupported source_type: {source_type}")
-
-
-def run_with_retry(cmd: List[str], retries: int) -> Tuple[bool, str]:
-    last_err = ""
-    for attempt in range(1, retries + 2):
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode == 0:
-            return True, ""
-        last_err = (proc.stderr or proc.stdout or "").strip()
-        if attempt <= retries:
-            time.sleep(min(3 * attempt, 10))
-    return False, last_err
-
-
-def run_cmd(cmd: List[str]) -> Tuple[bool, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode == 0:
-        return True, ""
-    return False, (proc.stderr or proc.stdout or "").strip()
-
-
-def run_verify_steps(verify_cmds: List[List[str]]) -> Tuple[bool, str, str]:
-    for verify_cmd in verify_cmds:
-        ok, err = run_cmd(verify_cmd)
-        if not ok:
-            return False, " ".join(verify_cmd), err
-    return True, "", ""
-
-
 def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _index_key(source_type: str, repo_id: str) -> str:
-    return f"{source_type.strip().lower()}::{repo_id.strip()}"
-
-
-def load_download_index(path: Path) -> Dict[str, Dict[str, Any]]:
-    if not path.exists():
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                row = json.loads(text)
-            except Exception:
-                continue
-            source_type = str(row.get("source_type", "")).strip().lower()
-            repo_id = str(row.get("repo_id", "")).strip()
-            if not source_type or not repo_id:
-                continue
-            out[_index_key(source_type, repo_id)] = row
-    return out
-
-
-def append_download_index(path: Path, record: Dict[str, Any]) -> None:
-    append_jsonl(path, record)
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Download datasets from sample json/jsonl.")
-    parser.add_argument("--sample", default="out/datasearcher/sample.jsonl")
-    parser.add_argument("--target-dir", default="/home/unlimitediw/workspace/DataBot_dataset")
-    parser.add_argument("--report", default="out/datasearcher/download_report.jsonl")
-    parser.add_argument("--download-index", default="state/datasearcher/download_index.jsonl")
-    parser.add_argument("--retries", type=int, default=2)
+    parser = argparse.ArgumentParser(
+        description="Fetch dataset samples via HuggingFace Datasets Server API (no physical download)."
+    )
+    parser.add_argument("--sample", default="out/datasearcher/sample.json")
+    parser.add_argument("--samples-dir", default="out/datasearcher/samples")
+    parser.add_argument("--report", default="out/datasearcher/sample_report.jsonl")
+    parser.add_argument("--row-length", type=int, default=5)
     parser.add_argument("--max-items", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--mode",
+        choices=("full", "slice"),
+        default="slice",
+        help="full=download_list, slice=slice_download_list",
+    )
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--delay", type=float, default=1.0)
     args = parser.parse_args()
 
     sample_path = Path(args.sample)
@@ -206,23 +131,23 @@ def main() -> int:
             sample_path = fallback
         else:
             raise FileNotFoundError(
-                f"Neither sample file exists: {args.sample} nor fallback out/datasearcher/sample.json"
+                f"Sample file not found: {args.sample} nor fallback out/datasearcher/sample.json"
             )
 
-    target_root = Path(args.target_dir)
-    target_root.mkdir(parents=True, exist_ok=True)
+    samples_dir = Path(args.samples_dir)
+    samples_dir.mkdir(parents=True, exist_ok=True)
     report_path = Path(args.report)
-    download_index_path = Path(args.download_index)
-    download_index = load_download_index(download_index_path)
 
-    datasets = load_samples(sample_path)
+    use_slice = args.mode == "slice"
+    datasets = load_samples(sample_path, use_slice=use_slice)
     if args.max_items > 0:
         datasets = datasets[: args.max_items]
 
-    _log(f"Starting: sample={sample_path}, target={target_root}, report={report_path}")
-    _log(f"Loaded {len(datasets)} datasets (index entries: {len(download_index)})")
+    _log(f"Starting: sample={sample_path}, samples_dir={samples_dir}, mode={args.mode}")
+    _log(f"Loaded {len(datasets)} datasets (API sample, no physical download)")
     if args.dry_run:
-        _log("DRY-RUN mode: no actual download")
+        _log("DRY-RUN mode")
+
     ok_count = 0
     fail_count = 0
     skip_count = 0
@@ -231,179 +156,93 @@ def main() -> int:
         source_type = str(item.get("source_type", "")).strip().lower()
         repo_id = str(item.get("repo_id", "")).strip()
         dataset_name = str(item.get("dataset_name", repo_id)).strip() or repo_id
-        key = _index_key(source_type, repo_id)
 
-        index_hit = download_index.get(key, {})
-        index_status = str(index_hit.get("status", "")).strip().lower()
-        index_path = Path(str(index_hit.get("path", "")).strip()) if index_hit.get("path") else None
-        if index_status == "success" and index_path and index_path.exists():
+        if source_type != "huggingface":
+            skip_count += 1
+            append_jsonl(
+                report_path,
+                {
+                    "ts": _now_ts(),
+                    "status": "skipped",
+                    "reason": "Viewer_Disabled",
+                    "message": "Datasets Server API is HuggingFace-only",
+                    "dataset_name": dataset_name,
+                    "source_type": source_type,
+                    "repo_id": repo_id,
+                },
+            )
+            _log(f"[{idx}/{len(datasets)}] SKIP {dataset_name} (GitHub, API not supported)")
+            continue
+
+        out_file = samples_dir / f"{_sanitize(repo_id)}_sample.json"
+        if out_file.exists():
             skip_count += 1
             append_jsonl(
                 report_path,
                 {
                     "ts": _now_ts(),
                     "status": "success",
-                    "action": "skip_index_hit",
-                    "dataset_name": dataset_name,
-                    "source_type": source_type,
-                    "repo_id": repo_id,
-                    "path": str(index_path),
-                },
-            )
-            _log(f"[{idx}/{len(datasets)}] SKIP_INDEX {dataset_name}")
-            continue
-        try:
-            cmd, local_dir = build_download_cmd(item, target_root)
-            verify_cmds = build_verify_cmds(item, local_dir)
-        except Exception as e:
-            fail_count += 1
-            append_jsonl(
-                report_path,
-                {
-                    "ts": _now_ts(),
-                    "status": "failed",
-                    "dataset_name": dataset_name,
-                    "source_type": source_type,
-                    "repo_id": repo_id,
-                    "error": str(e),
-                },
-            )
-            _log(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {e}")
-            continue
-
-        if local_dir.exists() and any(local_dir.iterdir()):
-            _log(f"[{idx}/{len(datasets)}] VERIFY_EXISTING {dataset_name} ...")
-            verified, failed_cmd, verify_err = run_verify_steps(verify_cmds)
-            if verified:
-                skip_count += 1
-                index_record = {
-                    "ts": _now_ts(),
-                    "status": "success",
-                    "dataset_name": dataset_name,
-                    "source_type": source_type,
-                    "repo_id": repo_id,
-                    "path": str(local_dir),
                     "action": "skip_existing",
-                }
-                download_index[key] = index_record
-                append_download_index(download_index_path, index_record)
-                append_jsonl(
-                    report_path,
-                    {
-                        "ts": _now_ts(),
-                        "status": "success",
-                        "action": "skip_existing",
-                        "dataset_name": dataset_name,
-                        "source_type": source_type,
-                        "repo_id": repo_id,
-                        "path": str(local_dir),
-                        "verify_cmds": verify_cmds,
-                    },
-                )
-                _log(f"[{idx}/{len(datasets)}] SKIP+VERIFIED {dataset_name}")
-            else:
-                fail_count += 1
-                append_jsonl(
-                    report_path,
-                    {
-                        "ts": _now_ts(),
-                        "status": "failed",
-                        "dataset_name": dataset_name,
-                        "source_type": source_type,
-                        "repo_id": repo_id,
-                        "path": str(local_dir),
-                        "verify_cmds": verify_cmds,
-                        "failed_verify_cmd": failed_cmd,
-                        "error": verify_err,
-                    },
-                )
-                _log(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
+                    "dataset_name": dataset_name,
+                    "repo_id": repo_id,
+                    "path": str(out_file),
+                },
+            )
+            _log(f"[{idx}/{len(datasets)}] SKIP_EXISTING {dataset_name}")
             continue
 
         if args.dry_run:
-            _log(f"[{idx}/{len(datasets)}] DRY-RUN {dataset_name}: {' '.join(cmd)}")
+            _log(f"[{idx}/{len(datasets)}] DRY-RUN {dataset_name}")
             append_jsonl(
                 report_path,
                 {
                     "ts": _now_ts(),
                     "status": "dry_run",
                     "dataset_name": dataset_name,
-                    "source_type": source_type,
                     "repo_id": repo_id,
-                    "cmd": cmd,
-                    "verify_cmds": verify_cmds,
-                    "path": str(local_dir),
                 },
             )
             continue
 
-        _log(f"[{idx}/{len(datasets)}] DOWNLOADING {dataset_name} ...")
-        ok, err = run_with_retry(cmd, retries=args.retries)
-        if ok:
-            print(f"[{idx}/{len(datasets)}] VERIFYING {dataset_name} ...")
-            verified, failed_cmd, verify_err = run_verify_steps(verify_cmds)
-            if verified:
-                ok_count += 1
-                index_record = {
-                    "ts": _now_ts(),
-                    "status": "success",
-                    "dataset_name": dataset_name,
-                    "source_type": source_type,
-                    "repo_id": repo_id,
-                    "path": str(local_dir),
-                    "action": "downloaded",
-                }
-                download_index[key] = index_record
-                append_download_index(download_index_path, index_record)
-                append_jsonl(
-                    report_path,
-                    {
-                        "ts": _now_ts(),
-                        "status": "success",
-                        "dataset_name": dataset_name,
-                        "source_type": source_type,
-                        "repo_id": repo_id,
-                        "cmd": cmd,
-                        "verify_cmds": verify_cmds,
-                        "path": str(local_dir),
-                    },
-                )
-                _log(f"[{idx}/{len(datasets)}] OK+VERIFIED {dataset_name}")
-            else:
-                fail_count += 1
-                append_jsonl(
-                    report_path,
-                    {
-                        "ts": _now_ts(),
-                        "status": "failed",
-                        "dataset_name": dataset_name,
-                        "source_type": source_type,
-                        "repo_id": repo_id,
-                        "cmd": cmd,
-                        "verify_cmds": verify_cmds,
-                        "failed_verify_cmd": failed_cmd,
-                        "path": str(local_dir),
-                        "error": verify_err,
-                    },
-                )
-                _log(f"[{idx}/{len(datasets)}] FAILED_VERIFY {dataset_name}: {verify_err}")
-        else:
+        _log(f"[{idx}/{len(datasets)}] FETCHING {dataset_name} ...")
+        rows, err = fetch_sample_via_api(
+            repo_id,
+            length=args.row_length,
+            retries=args.retries,
+            delay_sec=args.delay,
+        )
+        if err:
             fail_count += 1
             append_jsonl(
                 report_path,
                 {
                     "ts": _now_ts(),
                     "status": "failed",
+                    "reason": "Viewer_Disabled" if err == "Viewer_Disabled" else "api_error",
                     "dataset_name": dataset_name,
-                    "source_type": source_type,
                     "repo_id": repo_id,
-                    "cmd": cmd,
-                    "verify_cmds": verify_cmds,
-                    "path": str(local_dir),
                     "error": err,
                 },
             )
             _log(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {err}")
+            continue
+
+        payload = {"dataset": repo_id, "rows": rows}
+        out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        ok_count += 1
+        append_jsonl(
+            report_path,
+            {
+                "ts": _now_ts(),
+                "status": "success",
+                "dataset_name": dataset_name,
+                "repo_id": repo_id,
+                "path": str(out_file),
+                "row_count": len(rows) if rows else 0,
+            },
+        )
+        _log(f"[{idx}/{len(datasets)}] OK {dataset_name} -> {out_file.name} ({len(rows) if rows else 0} rows)")
+        time.sleep(args.delay)
 
     _log(f"Done: success={ok_count}, failed={fail_count}, skipped={skip_count}, total={len(datasets)}")
     return 0 if fail_count == 0 else 1
