@@ -209,6 +209,14 @@ def _tokenize(text: str) -> List[str]:
 
 
 def _score_candidate(item: Dict[str, Any], intent_text: str) -> float:
+    """
+    对候选数据集/仓库打分，用于排序。分值越高越靠前。
+
+    计分规则:
+    1. Intent 匹配: intent_text 中每个 token 若出现在 (dataset_name, repo_id, description, license) 中，+3.0
+    2. HuggingFace: downloads * 0.00001 + likes * 0.05
+    3. GitHub: stars * 0.01
+    """
     text = " ".join(
         [
             str(item.get("dataset_name", "")),
@@ -219,17 +227,19 @@ def _score_candidate(item: Dict[str, Any], intent_text: str) -> float:
     ).lower()
     score = 0.0
 
+    # 1. Intent 语义匹配: 每个匹配 token +3.0
     intent_tokens = set(_tokenize(intent_text))
     for token in intent_tokens:
         if token and token in text:
             score += 3.0
 
+    # 2. 平台热度加权
     source_type = str(item.get("source_type", "")).lower()
     if source_type == "huggingface":
-        score += float(item.get("downloads") or 0) * 0.00001
-        score += float(item.get("likes") or 0) * 0.05
+        score += float(item.get("downloads") or 0) * 0.00001  # 下载量
+        score += float(item.get("likes") or 0) * 0.05        # 点赞数
     if source_type == "github":
-        score += float(item.get("stars") or 0) * 0.01
+        score += float(item.get("stars") or 0) * 0.01       # 星标数
     return score
 
 
