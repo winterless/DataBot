@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from .datasets_server_api import fetch_total_size_bytes
+except ImportError:
+    from datasets_server_api import fetch_total_size_bytes
 
 
 # size_human patterns that indicate "too large" or "unknown" - exclude when matched
@@ -289,6 +295,7 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
             "size": item.get("size"),
             "size_human": item.get("size_human"),
             "size_mb": item.get("size_mb"),
+            "size_bytes": item.get("size_bytes"),
             "size_rows_equivalent": size_rows,
             "size_comparable_mb": size_comparable_mb,
             "updated_at": item.get("updated_at"),
@@ -367,6 +374,20 @@ def select_candidates_two_layer(
 
     # Slice download: top N from recall by rank (recall_rows already sorted by downloads/likes or stars)
     slice_rows = recall_rows[:slice_download_count] if slice_download_count > 0 else []
+
+    # 对 slice 内的 HF 数据集获取文件总大小（/size 或 HfApi 兜底），写入 size_bytes
+    for i, item in enumerate(recall_rows):
+        if i >= slice_download_count:
+            break
+        if str(item.get("source_type", "")).lower() != "huggingface":
+            continue
+        repo_id = str(item.get("repo_id", "")).strip()
+        if not repo_id:
+            continue
+        num_bytes, _ = fetch_total_size_bytes(repo_id)
+        if num_bytes is not None:
+            item["size_bytes"] = num_bytes
+        time.sleep(0.2)  # 限速，避免 API 过载
 
     return {
         "recall_pool": [

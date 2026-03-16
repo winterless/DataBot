@@ -94,6 +94,69 @@ def _is_exceeds_size_err(err: Optional[str]) -> bool:
     return err is not None and "exceeds the supported size" in err
 
 
+def fetch_size(
+    repo_id: str,
+    timeout_s: int = 30,
+    retries: int = DEFAULT_RETRIES,
+    delay_sec: float = DEFAULT_DELAY_SEC,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    请求 /size API，获取数据集大小（行数、字节数）。
+    Returns (size_data, error)。size_data 含 dataset/num_rows、num_bytes_parquet_files 等。
+    文档: https://huggingface.co/docs/dataset-viewer/size
+    """
+    rid_enc = urllib.parse.quote(str(repo_id), safe="")
+    url = f"{BASE_URL}/size?dataset={rid_enc}"
+    last_err = None
+    for attempt in range(1, retries + 2):
+        if attempt > 1:
+            time.sleep(delay_sec * attempt)
+        data, status, err = _get_json(url, timeout_s=timeout_s)
+        if status == 404:
+            return None, "Viewer_Disabled"
+        if status in (429, 501, 500):
+            last_err = err or f"HTTP {status}"
+            continue
+        if data is None:
+            last_err = err
+            continue
+        return data, None
+    return None, last_err or "Unknown error"
+
+
+def fetch_total_size_bytes(
+    repo_id: str,
+    timeout_s: int = 30,
+    retries: int = DEFAULT_RETRIES,
+    delay_sec: float = DEFAULT_DELAY_SEC,
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    获取数据集文件总大小（字节）。仅返回一个数字。
+    优先用 /size API；若 Viewer_Disabled 则兜底用 HfApi.dataset_info 汇总仓库文件大小。
+    Returns (num_bytes, error)。
+    """
+    data, err = fetch_size(repo_id, timeout_s=timeout_s, retries=retries, delay_sec=delay_sec)
+    if data is not None:
+        size_obj = data.get("size") or {}
+        ds = size_obj.get("dataset") or {}
+        # 优先 parquet（更接近实际），其次原始文件
+        n = ds.get("num_bytes_parquet_files") or ds.get("num_bytes_original_files")
+        if isinstance(n, (int, float)) and n >= 0:
+            return int(n), None
+    if err != "Viewer_Disabled":
+        return None, err
+
+    # 兜底：HfApi.dataset_info 汇总仓库文件
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().dataset_info(repo_id, files_metadata=True)
+        total = sum(getattr(s, "size", None) or 0 for s in (info.siblings or []))
+        return total if total > 0 else None, None if total > 0 else "No file metadata"
+    except Exception as e:
+        return None, str(e)
+
+
 def fetch_rows(
     repo_id: str,
     config: str,

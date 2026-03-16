@@ -15,7 +15,7 @@ search → slice → llm_eval → eval
 
 | 阶段 | 命令 | 输入 | 输出 | 说明 |
 |------|------|------|------|------|
-| **search** | `MODE=search ./smoke_datasearcher.sh` | - | `sample.json`, `recall_pool.jsonl` | LLM 解析 intent，调用 HF/GH API 检索 |
+| **search** | `MODE=search ./smoke_datasearcher.sh` | - | `sample.json`, `recall_pool.jsonl` | LLM 解析 intent，调用 HF/GH API 检索。对 slice 内 HF 数据集获取 size_bytes |
 | **slice** | `MODE=slice ./smoke_datasearcher.sh` | sample.json | `samples/*.json` | 按 slice_download_list 拉取样本（API，无物理下载）。默认前 5 行；`RANDOM_SAMPLE=1` 时从完整范围随机抽取离散行 |
 | **llm_eval** | `MODE=llm_eval ./smoke_datasearcher.sh` | samples/, recall_pool | `sample_llm_scored.jsonl` | 对每条 sample 第一条数据调用 LLM 打分（截断 3 万字符） |
 | **eval** | `MODE=eval ./smoke_datasearcher.sh` | samples/, recall_pool, sample_llm_scored | `sample_scored.jsonl` | 合并 metadata + LLM 分数，纯本地计算 |
