@@ -296,6 +296,7 @@ def _normalize_selected_item(item: Dict[str, Any], reason: str) -> Dict[str, Any
             "size_human": item.get("size_human"),
             "size_mb": item.get("size_mb"),
             "size_bytes": item.get("size_bytes"),
+            "size_gb": round(sb / (1024**3), 3) if (sb := item.get("size_bytes")) is not None else None,
             "size_rows_equivalent": size_rows,
             "size_comparable_mb": size_comparable_mb,
             "updated_at": item.get("updated_at"),

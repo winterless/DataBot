@@ -3,7 +3,8 @@
 # 用法：
 #   search  -> 仅召回
 #   slice   -> search + API Sample（50 个，前 5 行 JSON，无物理下载）+ 打分
-#   download -> search + slice + API Sample（10 个）
+#   generate_download_list -> 从 sample_scored 生成 download_list（可手动筛选 download_list 后再 download）
+#   download -> 全量下载（需先有 download_list.jsonl）
 #   eval    -> 仅对已存在的 samples 打分（增量，不下载）
 #   llm_eval -> 调用 API 模型对每个 sample 第一条数据打分（实时输出，可中断续跑）
 set -euo pipefail
@@ -28,8 +29,21 @@ _run_slice() {
   python "src/datasearcher/downloader.py" --sample "out/datasearcher/sample.json" --samples-dir "out/datasearcher/samples" --mode slice $EXTRA
 }
 
+_run_generate_download_list() {
+  if [[ ! -f out/datasearcher/sample_scored.jsonl ]]; then
+    echo "[smoke] sample_scored.jsonl 不存在，请先运行 MODE=eval" >&2
+    exit 1
+  fi
+  python scripts/generate_download_list.py
+  echo "[smoke] 已生成 download_list.jsonl，可手动筛选后再运行 MODE=download" >&2
+}
+
 _run_download() {
-  python "src/datasearcher/downloader.py" --sample "out/datasearcher/sample.json" --samples-dir "out/datasearcher/samples" --mode full
+  if [[ ! -f out/datasearcher/download_list.jsonl ]]; then
+    echo "[smoke] download_list.jsonl 不存在，请先运行 MODE=generate_download_list" >&2
+    exit 1
+  fi
+  python "src/datasearcher/downloader.py" --download-list "out/datasearcher/download_list.jsonl" --samples-dir "out/datasearcher/samples" --download-dir "data" --mode full
 }
 
 _run_eval() {
@@ -52,9 +66,10 @@ case "${MODE}" in
     _run_search
     _run_slice
     ;;
+  generate_download_list)
+    _run_generate_download_list
+    ;;
   download)
-    _run_search
-    _run_slice
     _run_download
     ;;
   eval)
@@ -64,7 +79,7 @@ case "${MODE}" in
     _run_llm_eval
     ;;
   *)
-    echo "MODE must be search|slice|download|eval|llm_eval" >&2
+    echo "MODE must be search|slice|generate_download_list|download|eval|llm_eval" >&2
     exit 2
     ;;
 esac
