@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Convert agentic trajectory JSON/JSONL files into a ShareGPT-like format.
+Convert agentic trajectory JSON/JSONL files into a strict ShareGPT-like format.
 
 Default transformation:
-- keep top-level record fields, but rewrite `conversations`
-- rename per-turn `role` -> `from`
-- rename per-turn `content` -> `value`
+- keep only top-level `conversations`
+- keep only per-turn `from` / `value`
 - wrap assistant `tool_calls` with <tool_call>...</tool_call>
 - wrap tool/system observations with <tool_response>...</tool_response>
+- map roles as: system -> system, user -> human, assistant -> gpt,
+  tool/system observation -> observation
 
 Examples:
 python scripts/convert_agentic_to_sharegpt.py \
@@ -100,6 +101,17 @@ def _is_observation_turn(turn: Dict[str, Any]) -> bool:
     return role == "tool" or (role == "system" and _is_system_observation_text(content))
 
 
+def _map_role(role: str, *, is_observation: bool) -> str:
+    if is_observation:
+        return "observation"
+    role_map = {
+        "system": "system",
+        "user": "human",
+        "assistant": "gpt",
+    }
+    return role_map.get(role, role or "unknown")
+
+
 def _convert_turn(
     turn: Dict[str, Any],
     *,
@@ -121,14 +133,10 @@ def _convert_turn(
     if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
         value_parts.append(_wrap(tool_call_tag, _serialize_tool_calls(tool_calls)))
 
-    new_turn = {
-        key: value
-        for key, value in turn.items()
-        if key not in {"role", "content"}
+    return {
+        "from": _map_role(role, is_observation=is_observation),
+        "value": "\n\n".join(part for part in value_parts if part).strip(),
     }
-    new_turn["from"] = "observation" if is_observation else role
-    new_turn["value"] = "\n\n".join(part for part in value_parts if part).strip()
-    return new_turn
 
 
 def _convert_record(
@@ -141,16 +149,16 @@ def _convert_record(
     if not isinstance(conversations, list):
         raise ValueError("Record missing conversations list")
 
-    converted = dict(record)
-    converted["conversations"] = [
-        _convert_turn(
-            turn if isinstance(turn, dict) else {"role": "", "content": _stringify(turn)},
-            tool_call_tag=tool_call_tag,
-            tool_response_tag=tool_response_tag,
-        )
-        for turn in conversations
-    ]
-    return converted
+    return {
+        "conversations": [
+            _convert_turn(
+                turn if isinstance(turn, dict) else {"role": "", "content": _stringify(turn)},
+                tool_call_tag=tool_call_tag,
+                tool_response_tag=tool_response_tag,
+            )
+            for turn in conversations
+        ]
+    }
 
 
 def build_argparser() -> argparse.ArgumentParser:

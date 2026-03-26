@@ -386,3 +386,9 @@ DataBot/
 - `LLMRunner`：`${LLMRUNNER_HOME:-/home/unlimitediw/workspace/LLMRunner}`
 - `Eval`：`${EVAL_HOME:-/home/unlimitediw/workspace/eval}`
 - `AI Coder`：Cursor Admin API / Sandbox Service（仅 PR/Diff 输出）
+
+python scripts/filter_agentic_adaptor.py \
+  --input data/hf__stepfun-ai__Step-3.5-Flash-SFT/json/general \
+  --output out/agentic/step35_agentic_sft \
+  --reject-output out/agentic/step35_agentic_rest \
+  --summary-output out/agentic/step35_agentic_summary.json
