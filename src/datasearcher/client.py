@@ -372,6 +372,9 @@ def _build_hf_fallback_queries(initial_query: str, raw_prompt: str) -> List[str]
     generic_seeds = [
         "agent", "agentic", "instruction", "reasoning", "code",
         "function calling", "trajectory", "tool", "llm",
+        "instruction-tuning", "chat", "chat models", "text generation",
+        "supervised fine-tuning", "general-domain", "multilingual",
+        "sft", "cpt",
     ]
     for seed in generic_seeds:
         if seed not in fallback:

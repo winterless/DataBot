@@ -27,6 +27,9 @@
     "retries": 2,
     "verify_hf_exists": true
   },
+  "download": {
+    "max_workers": 4
+  },
   "selection": {
     "recall_pool_size": 12000,
     "download_size": 10,

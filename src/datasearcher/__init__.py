@@ -9,5 +9,6 @@ DataSearcher 包 — 执行层内置「数据发现」模块。
 本包包含：
 - client：Sample 步骤，LLM 检索 + 结构化输出校验，产出 sample.json。
 - downloader：Download 步骤，按 sample 下载 HuggingFace/GitHub 并校验，产出 download_report。
+- agentic_adaptor：从超大原始 JSON 分片中流式筛选适合 agentic SFT 的轨迹。
 """
 

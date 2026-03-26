@@ -10,9 +10,11 @@ DataSearcher Sample Fetcher / Full Downloader。
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -106,70 +108,141 @@ def _sanitize_local_name(repo_id: str) -> str:
     return repo_id.replace("/", "__")
 
 
+def _load_download_max_workers(default: int = 4) -> int:
+    config_path = Path("configs/datasearcher_api.json")
+    if not config_path.exists():
+        return default
+
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+    download_cfg = cfg.get("download") or {}
+    try:
+        return max(1, int(download_cfg.get("max_workers", default)))
+    except Exception:
+        return default
+
+
+def _download_one_dataset(
+    idx: int,
+    total: int,
+    item: Dict[str, Any],
+    download_dir: Path,
+    report_path: Path,
+    retries: int,
+    log_lock: threading.Lock,
+    report_lock: threading.Lock,
+) -> str:
+    from huggingface_hub import snapshot_download
+
+    def log_threadsafe(message: str) -> None:
+        with log_lock:
+            _log(message)
+
+    def append_report(record: Dict[str, Any]) -> None:
+        with report_lock:
+            append_jsonl(report_path, record)
+
+    source_type = str(item.get("source_type", "")).strip().lower()
+    repo_id = str(item.get("repo_id", "")).strip()
+    dataset_name = str(item.get("dataset_name", repo_id)).strip() or repo_id
+
+    if source_type != "huggingface":
+        append_report({"ts": _now_ts(), "status": "skipped", "reason": "HF-only", "repo_id": repo_id})
+        log_threadsafe(f"[{idx}/{total}] SKIP {dataset_name} (非 HF)")
+        return "skipped"
+
+    local_dir = download_dir / f"hf__{_sanitize_local_name(repo_id)}"
+    had_existing_files = local_dir.exists() and any(local_dir.iterdir())
+    action = "RESUMING" if had_existing_files else "DOWNLOADING"
+    log_threadsafe(f"[{idx}/{total}] {action} {dataset_name} -> {local_dir} ...")
+
+    last_err = None
+    for attempt in range(1, retries + 2):
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                local_dir=str(local_dir),
+            )
+            append_report(
+                {
+                    "ts": _now_ts(),
+                    "status": "success",
+                    "action": "resumed" if had_existing_files else "downloaded",
+                    "repo_id": repo_id,
+                    "path": str(local_dir),
+                },
+            )
+            log_threadsafe(f"[{idx}/{total}] OK {dataset_name}")
+            return "success"
+        except Exception as e:
+            last_err = str(e)
+            if attempt <= retries:
+                time.sleep(attempt * 2)
+                continue
+            append_report({"ts": _now_ts(), "status": "failed", "repo_id": repo_id, "error": last_err})
+            log_threadsafe(f"[{idx}/{total}] FAILED {dataset_name}: {last_err}")
+            return "failed"
+
+    return "failed"
+
+
 def _run_full_download(
     datasets: List[Dict[str, Any]],
     download_dir: Path,
     report_path: Path,
     log_fn,
     retries: int = 2,
+    max_workers: int = 4,
 ) -> int:
-    """全量下载：始终调用 snapshot_download，让 HF Hub 自动补齐缺失文件。"""
+    """全量下载：按 repo 并行调用 snapshot_download，让 HF Hub 自动补齐缺失文件。"""
     try:
-        from huggingface_hub import snapshot_download
+        import huggingface_hub  # noqa: F401
     except ImportError:
         log_fn("ERROR: huggingface_hub 未安装，无法全量下载")
         return 1
 
     download_dir.mkdir(parents=True, exist_ok=True)
+    max_workers = max(1, int(max_workers))
+    log_fn(f"Full download concurrency: max_workers={max_workers}")
     ok_count = 0
     fail_count = 0
     skip_count = 0
+    log_lock = threading.Lock()
+    report_lock = threading.Lock()
 
-    for idx, item in enumerate(datasets, start=1):
-        source_type = str(item.get("source_type", "")).strip().lower()
-        repo_id = str(item.get("repo_id", "")).strip()
-        dataset_name = str(item.get("dataset_name", repo_id)).strip() or repo_id
-
-        if source_type != "huggingface":
-            skip_count += 1
-            append_jsonl(report_path, {"ts": _now_ts(), "status": "skipped", "reason": "HF-only", "repo_id": repo_id})
-            log_fn(f"[{idx}/{len(datasets)}] SKIP {dataset_name} (非 HF)")
-            continue
-
-        local_dir = download_dir / f"hf__{_sanitize_local_name(repo_id)}"
-        had_existing_files = local_dir.exists() and any(local_dir.iterdir())
-        action = "RESUMING" if had_existing_files else "DOWNLOADING"
-        log_fn(f"[{idx}/{len(datasets)}] {action} {dataset_name} -> {local_dir} ...")
-        last_err = None
-        for attempt in range(1, retries + 2):
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_repo = {
+            executor.submit(
+                _download_one_dataset,
+                idx,
+                len(datasets),
+                item,
+                download_dir,
+                report_path,
+                retries,
+                log_lock,
+                report_lock,
+            ): str(item.get("repo_id", "")).strip()
+            for idx, item in enumerate(datasets, start=1)
+        }
+        for future in as_completed(future_to_repo):
             try:
-                snapshot_download(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    local_dir=str(local_dir),
-                )
-                ok_count += 1
-                append_jsonl(
-                    report_path,
-                    {
-                        "ts": _now_ts(),
-                        "status": "success",
-                        "action": "resumed" if had_existing_files else "downloaded",
-                        "repo_id": repo_id,
-                        "path": str(local_dir),
-                    },
-                )
-                log_fn(f"[{idx}/{len(datasets)}] OK {dataset_name}")
-                break
+                result = future.result()
             except Exception as e:
-                last_err = str(e)
-                if attempt <= retries:
-                    time.sleep(attempt * 2)
-                    continue
                 fail_count += 1
-                append_jsonl(report_path, {"ts": _now_ts(), "status": "failed", "repo_id": repo_id, "error": last_err})
-                log_fn(f"[{idx}/{len(datasets)}] FAILED {dataset_name}: {last_err}")
-                break
+                log_fn(f"FAILED worker for {future_to_repo[future]}: {e}")
+                continue
+
+            if result == "success":
+                ok_count += 1
+            elif result == "failed":
+                fail_count += 1
+            else:
+                skip_count += 1
 
     log_fn(f"Done: success={ok_count}, failed={fail_count}, skipped={skip_count}, total={len(datasets)}")
     return 0 if fail_count == 0 else 1
@@ -202,6 +275,7 @@ def main() -> int:
     parser.add_argument("--no-background", action="store_true", help="全量下载时前台执行（默认后台）")
     parser.add_argument("--download-dir", default="data", help="全量下载保存目录")
     parser.add_argument("--download-log", default="out/datasearcher/download_full.log", help="全量下载日志")
+    parser.add_argument("--download-max-workers", type=int, default=0, help="全量下载的 repo 级并发数；0 表示读取配置")
     args = parser.parse_args()
 
     samples_dir = Path(args.samples_dir)
@@ -239,6 +313,8 @@ def main() -> int:
                 except json.JSONDecodeError:
                     continue
         _log(f"Loaded {len(datasets)} datasets from download_list={args.download_list}")
+        download_max_workers = args.download_max_workers or _load_download_max_workers()
+        _log(f"Using download_max_workers={download_max_workers}")
 
         if not args.no_background:
             # 后台执行：spawn 子进程，主进程立即返回
@@ -250,6 +326,7 @@ def main() -> int:
                 "--samples-dir", args.samples_dir,
                 "--download-dir", args.download_dir,
                 "--download-log", args.download_log,
+                "--download-max-workers", str(download_max_workers),
                 "--no-background",
             ]
             proc = subprocess.Popen(
@@ -264,7 +341,14 @@ def main() -> int:
 
         # 前台执行全量下载
         report_full = Path(args.download_log).parent / "download_full_report.jsonl"
-        return _run_full_download(datasets, Path(args.download_dir), report_full, _log, args.retries)
+        return _run_full_download(
+            datasets,
+            Path(args.download_dir),
+            report_full,
+            _log,
+            args.retries,
+            max_workers=download_max_workers,
+        )
     else:
         sample_path = Path(args.sample)
         if not sample_path.exists():
