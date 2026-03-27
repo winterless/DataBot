@@ -95,6 +95,17 @@ def _serialize_tool_calls(tool_calls: List[Any]) -> str:
     return _stringify(tool_calls)
 
 
+def _serialize_available_tools(tools: List[Any]) -> str:
+    return _wrap("available_tools", _stringify(tools))
+
+
+def _build_system_prefix(available_tools: List[Any]) -> str:
+    parts = ["you may call one or more functions to assist with the user query"]
+    if available_tools:
+        parts.append(_serialize_available_tools(available_tools))
+    return "\n\n".join(parts).strip()
+
+
 def _is_observation_turn(turn: Dict[str, Any]) -> bool:
     role = str(turn.get("role", "")).strip()
     content = _stringify(turn.get("content", ""))
@@ -139,6 +150,38 @@ def _convert_turn(
     }
 
 
+def _collect_available_tools(conversations: List[Any]) -> List[Any]:
+    merged: List[Any] = []
+    seen: set[str] = set()
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        tools = turn.get("tools")
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            key = _stringify(tool)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(tool)
+    return merged
+
+
+def _inject_available_tools(
+    converted_turns: List[Dict[str, Any]],
+    available_tools: List[Any],
+) -> List[Dict[str, Any]]:
+    system_prefix = _build_system_prefix(available_tools)
+    for turn in converted_turns:
+        if turn.get("from") == "system":
+            current = str(turn.get("value", "")).strip()
+            turn["value"] = f"{system_prefix}\n\n{current}".strip()
+            return converted_turns
+
+    return [{"from": "system", "value": system_prefix}, *converted_turns]
+
+
 def _convert_record(
     record: Dict[str, Any],
     *,
@@ -149,8 +192,7 @@ def _convert_record(
     if not isinstance(conversations, list):
         raise ValueError("Record missing conversations list")
 
-    return {
-        "conversations": [
+    converted_turns = [
             _convert_turn(
                 turn if isinstance(turn, dict) else {"role": "", "content": _stringify(turn)},
                 tool_call_tag=tool_call_tag,
@@ -158,7 +200,11 @@ def _convert_record(
             )
             for turn in conversations
         ]
-    }
+    converted_turns = _inject_available_tools(
+        converted_turns,
+        _collect_available_tools(conversations),
+    )
+    return {"conversations": converted_turns}
 
 
 def build_argparser() -> argparse.ArgumentParser:
