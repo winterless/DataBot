@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Convert agentic trajectory JSON/JSONL files into a strict ShareGPT-like format.
+Convert agentic trajectory JSON/JSONL files into a ShareGPT structure that is
+strictly compatible with `SharegptStyleInstructionHandler`.
 
-Default transformation:
-- keep only top-level `conversations`
-- keep only per-turn `from` / `value`
-- wrap assistant `tool_calls` with <tool_call>...</tool_call>
-- wrap tool/system observations with <tool_response>...</tool_response>
-- map roles as: system -> system, user -> human, assistant -> gpt,
-  tool/system observation -> observation
+Key normalization rules:
+- keep only per-turn `from` / `value` inside top-level `conversations`
+- move regular system prompts to top-level `system`
+- move declared tools to top-level `tools`
+- convert assistant turns with `tool_calls` into explicit `function_call` turns
+- merge consecutive tool/system observation turns into a single `observation`
+- preserve alternating ShareGPT slots:
+  - even positions: `human` / `observation`
+  - odd positions: `gpt` / `function_call`
 
 Examples:
 python scripts/convert_agentic_to_sharegpt.py \
@@ -22,7 +25,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,59 +98,111 @@ def _serialize_tool_calls(tool_calls: List[Any]) -> str:
     return _stringify(tool_calls)
 
 
-def _serialize_available_tools(tools: List[Any]) -> str:
-    return _wrap("available_tools", _stringify(tools))
-
-
-def _build_system_prefix(available_tools: List[Any]) -> str:
-    parts = ["you may call one or more functions to assist with the user query"]
-    if available_tools:
-        parts.append(_serialize_available_tools(available_tools))
-    return "\n\n".join(parts).strip()
-
-
 def _is_observation_turn(turn: Dict[str, Any]) -> bool:
     role = str(turn.get("role", "")).strip()
     content = _stringify(turn.get("content", ""))
     return role == "tool" or (role == "system" and _is_system_observation_text(content))
 
 
-def _map_role(role: str, *, is_observation: bool) -> str:
-    if is_observation:
-        return "observation"
-    role_map = {
-        "system": "system",
-        "user": "human",
-        "assistant": "gpt",
-    }
-    return role_map.get(role, role or "unknown")
+def _normalize_text_parts(parts: List[str]) -> str:
+    return "\n\n".join(part.strip() for part in parts if str(part).strip()).strip()
 
 
-def _convert_turn(
+def _build_message(role: str, value: str) -> Optional[Dict[str, Any]]:
+    normalized_value = value.strip()
+    if not normalized_value:
+        return None
+    return {"from": role, "value": normalized_value}
+
+
+def _message_side(role: str) -> str:
+    if role in {"human", "observation"}:
+        return "input"
+    if role in {"gpt", "function_call"}:
+        return "output"
+    raise ValueError(f"Unsupported ShareGPT role: {role}")
+
+
+def _merge_sharegpt_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Collapse adjacent messages that belong to the same ShareGPT side.
+
+    This repairs dirty trajectories such as:
+    - `human -> human`
+    - `gpt -> function_call`
+    - `function_call -> function_call`
+
+    If either assistant-side message contains a tool call, keep the merged role as
+    `function_call`; otherwise keep `gpt`.
+    """
+    merged: List[Dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("from", "")).strip()
+        value = str(message.get("value", "")).strip()
+        if not role or not value:
+            continue
+
+        if not merged:
+            merged.append({"from": role, "value": value})
+            continue
+
+        prev = merged[-1]
+        prev_role = str(prev.get("from", "")).strip()
+        if _message_side(prev_role) != _message_side(role):
+            merged.append({"from": role, "value": value})
+            continue
+
+        merged_role = prev_role
+        if role == "function_call" or prev_role == "function_call":
+            merged_role = "function_call"
+
+        prev["from"] = merged_role
+        prev["value"] = _normalize_text_parts([str(prev.get("value", "")), value])
+
+    return merged
+
+
+def _maybe_close_pending_observation(converted_turns: List[Dict[str, Any]]) -> None:
+    """
+    Some source trajectories start a new user turn immediately after a tool
+    observation, without an assistant natural-language wrap-up. Insert a short
+    assistant close-out so the resulting ShareGPT sequence still alternates
+    legally for `SharegptStyleInstructionHandler`.
+    """
+    if not converted_turns:
+        return
+    last_role = str(converted_turns[-1].get("from", "")).strip()
+    if last_role == "observation":
+        converted_turns.append({"from": "gpt", "value": "Tool result received."})
+
+
+def _build_observation_message(
+    turns: List[Dict[str, Any]],
+    *,
+    tool_response_tag: str,
+) -> Optional[Dict[str, Any]]:
+    parts: List[str] = []
+    for turn in turns:
+        content = _stringify(turn.get("content", "")).strip()
+        if content:
+            parts.append(_wrap(tool_response_tag, content))
+    return _build_message("observation", _normalize_text_parts(parts))
+
+
+def _build_function_call_message(
     turn: Dict[str, Any],
     *,
     tool_call_tag: str,
-    tool_response_tag: str,
-) -> Dict[str, Any]:
-    role = str(turn.get("role", "")).strip()
-    content = _stringify(turn.get("content", ""))
-    value_parts: List[str] = []
-    is_observation = _is_observation_turn(turn)
-
-    if content:
-        if is_observation:
-            value_parts.append(_wrap(tool_response_tag, content))
-        else:
-            value_parts.append(content)
-
+) -> Optional[Dict[str, Any]]:
+    content = _stringify(turn.get("content", "")).strip()
     tool_calls = turn.get("tool_calls")
-    if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
-        value_parts.append(_wrap(tool_call_tag, _serialize_tool_calls(tool_calls)))
-
-    return {
-        "from": _map_role(role, is_observation=is_observation),
-        "value": "\n\n".join(part for part in value_parts if part).strip(),
-    }
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    parts: List[str] = []
+    if content:
+        parts.append(content)
+    parts.append(_wrap(tool_call_tag, _serialize_tool_calls(tool_calls)))
+    return _build_message("function_call", _normalize_text_parts(parts))
 
 
 def _collect_available_tools(conversations: List[Any]) -> List[Any]:
@@ -168,18 +223,124 @@ def _collect_available_tools(conversations: List[Any]) -> List[Any]:
     return merged
 
 
-def _inject_available_tools(
-    converted_turns: List[Dict[str, Any]],
-    available_tools: List[Any],
-) -> List[Dict[str, Any]]:
-    system_prefix = _build_system_prefix(available_tools)
-    for turn in converted_turns:
-        if turn.get("from") == "system":
-            current = str(turn.get("value", "")).strip()
-            turn["value"] = f"{system_prefix}\n\n{current}".strip()
-            return converted_turns
+def _collect_system_prompt(conversations: List[Any]) -> str:
+    parts: List[str] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role", "")).strip()
+        if role != "system" or _is_observation_turn(turn):
+            continue
+        content = _stringify(turn.get("content", "")).strip()
+        if content:
+            parts.append(content)
+    return _normalize_text_parts(parts)
 
-    return [{"from": "system", "value": system_prefix}, *converted_turns]
+
+def _convert_conversations(
+    conversations: List[Any],
+    *,
+    tool_call_tag: str,
+    tool_response_tag: str,
+) -> List[Dict[str, Any]]:
+    converted_turns: List[Dict[str, Any]] = []
+    idx = 0
+    total = len(conversations)
+
+    while idx < total:
+        raw_turn = conversations[idx]
+        turn = raw_turn if isinstance(raw_turn, dict) else {"role": "", "content": _stringify(raw_turn)}
+        role = str(turn.get("role", "")).strip()
+
+        if role == "system" and not _is_observation_turn(turn):
+            idx += 1
+            continue
+
+        if role == "user":
+            _maybe_close_pending_observation(converted_turns)
+            message = _build_message("human", _stringify(turn.get("content", "")))
+            if message is not None:
+                converted_turns.append(message)
+            idx += 1
+            continue
+
+        if role == "assistant":
+            tool_calls = turn.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                message = _build_function_call_message(turn, tool_call_tag=tool_call_tag)
+                if message is not None:
+                    converted_turns.append(message)
+
+                observation_turns: List[Dict[str, Any]] = []
+                next_idx = idx + 1
+                while next_idx < total:
+                    next_raw = conversations[next_idx]
+                    next_turn = (
+                        next_raw
+                        if isinstance(next_raw, dict)
+                        else {"role": "", "content": _stringify(next_raw)}
+                    )
+                    if not _is_observation_turn(next_turn):
+                        break
+                    observation_turns.append(next_turn)
+                    next_idx += 1
+
+                observation_message = _build_observation_message(
+                    observation_turns,
+                    tool_response_tag=tool_response_tag,
+                )
+                if observation_message is not None:
+                    converted_turns.append(observation_message)
+
+                idx = next_idx
+                continue
+
+            message = _build_message("gpt", _stringify(turn.get("content", "")))
+            if message is not None:
+                converted_turns.append(message)
+            idx += 1
+            continue
+
+        if _is_observation_turn(turn):
+            observation_turns = [turn]
+            next_idx = idx + 1
+            while next_idx < total:
+                next_raw = conversations[next_idx]
+                next_turn = (
+                    next_raw
+                    if isinstance(next_raw, dict)
+                    else {"role": "", "content": _stringify(next_raw)}
+                )
+                if not _is_observation_turn(next_turn):
+                    break
+                observation_turns.append(next_turn)
+                next_idx += 1
+
+            observation_message = _build_observation_message(
+                observation_turns,
+                tool_response_tag=tool_response_tag,
+            )
+            if observation_message is not None:
+                converted_turns.append(observation_message)
+            idx = next_idx
+            continue
+
+        raise ValueError(f"Unsupported role during ShareGPT conversion: {role or '<empty>'}")
+
+    return _merge_sharegpt_messages(converted_turns)
+
+
+def _validate_strict_sharegpt_turns(messages: List[Dict[str, Any]]) -> None:
+    odd_tags = ("human", "observation")
+    even_tags = ("gpt", "function_call")
+    accept_tags = (odd_tags, even_tags)
+    for turn_idx, message in enumerate(messages):
+        role = str(message.get("from", "")).strip()
+        if role not in accept_tags[turn_idx % 2]:
+            raise ValueError(
+                "Converted messages do not satisfy ShareGPT alternation: "
+                f"index={turn_idx}, role={role}, messages={messages}"
+            )
 
 
 def _convert_record(
@@ -192,19 +353,24 @@ def _convert_record(
     if not isinstance(conversations, list):
         raise ValueError("Record missing conversations list")
 
-    converted_turns = [
-            _convert_turn(
-                turn if isinstance(turn, dict) else {"role": "", "content": _stringify(turn)},
-                tool_call_tag=tool_call_tag,
-                tool_response_tag=tool_response_tag,
-            )
-            for turn in conversations
-        ]
-    converted_turns = _inject_available_tools(
-        converted_turns,
-        _collect_available_tools(conversations),
+    converted_turns = _convert_conversations(
+        conversations,
+        tool_call_tag=tool_call_tag,
+        tool_response_tag=tool_response_tag,
     )
-    return {"conversations": converted_turns}
+    _validate_strict_sharegpt_turns(converted_turns)
+
+    output_record: Dict[str, Any] = {"conversations": converted_turns}
+
+    system_prompt = _collect_system_prompt(conversations)
+    if system_prompt:
+        output_record["system"] = system_prompt
+
+    available_tools = _collect_available_tools(conversations)
+    if available_tools:
+        output_record["tools"] = _stringify(available_tools)
+
+    return output_record
 
 
 def build_argparser() -> argparse.ArgumentParser:
